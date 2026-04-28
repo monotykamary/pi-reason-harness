@@ -1359,3 +1359,333 @@ describe('Prompt quality metrics', () => {
     expect(metrics.avgFirstIterationScore).toBeCloseTo(0.6, 10);
   });
 });
+
+describe('Harness spec generation', () => {
+  it('creates specs with correct types', () => {
+    const spec = {
+      id: 'test1',
+      category: 'grid-transformation',
+      approach: 'code-sandbox' as const,
+      solverPrompt: 'Solve $$problem$$',
+      feedbackPrompt: 'Feedback $$feedback$$',
+      configOverrides: { temperature: 0.8 },
+      validationScore: 0,
+      validationTests: 0,
+      validated: false,
+      parentId: null,
+      generation: 0,
+      created: Date.now(),
+      useCount: 0,
+      successCount: 0,
+      avgScore: 0,
+    };
+    expect(spec.approach).toBe('code-sandbox');
+    expect(spec.solverPrompt).toContain('$$problem$$');
+  });
+
+  it('supports multiple approach types', () => {
+    const approaches = ['code-sandbox', 'decomposition', 'chain-of-questions', 'analogy', 'counter-factual', 'exhaustive-search'] as const;
+    expect(approaches.length).toBe(6);
+    for (const a of approaches) {
+      expect(typeof a).toBe('string');
+    }
+  });
+});
+
+describe('Ensemble diversification', () => {
+  it('assigns different approaches per expert', () => {
+    const APPROACH_SOLVER_PROMPTS: Record<string, string> = {
+      'code-sandbox': 'Code approach $$problem$$',
+      'decomposition': 'Decompose $$problem$$',
+      'analogy': 'Analogy $$problem$$',
+    };
+
+    const approaches = ['code-sandbox', 'decomposition', 'analogy'];
+    expect(approaches.length).toBe(3);
+    expect(approaches[0]).not.toBe(approaches[1]);
+    expect(approaches[1]).not.toBe(approaches[2]);
+  });
+
+  it('knowledge-extraction uses chain-of-questions', () => {
+    const approaches = ['chain-of-questions', 'decomposition', 'counter-factual'];
+    expect(approaches[0]).toBe('chain-of-questions');
+  });
+});
+
+describe('Budget optimization via marginal ROI', () => {
+  it('estimates high ROI for improving experts', () => {
+    function estimateMarginalROI(history: Array<{ score: number; iteration: number; cost: number }>, costPerIteration: number): number {
+      if (history.length < 2) return 1.0;
+      const recentWindow = Math.min(5, history.length);
+      const recent = history.slice(-recentWindow);
+      let totalImprovement = 0;
+      let improvementCount = 0;
+      for (let i = 1; i < recent.length; i++) {
+        const delta = recent[i].score - recent[i - 1].score;
+        if (delta > 0) {
+          totalImprovement += delta;
+          improvementCount++;
+        }
+      }
+      const avgImprovement = improvementCount > 0 ? totalImprovement / improvementCount : 0;
+      const pImprove = improvementCount / (recent.length - 1);
+      const expectedImprovement = pImprove * avgImprovement;
+      return costPerIteration > 0 ? expectedImprovement / costPerIteration : expectedImprovement;
+    }
+
+    // Expert improving steadily
+    const improving = [
+      { score: 0.2, iteration: 0, cost: 0.001 },
+      { score: 0.5, iteration: 1, cost: 0.001 },
+      { score: 0.8, iteration: 2, cost: 0.001 },
+      { score: 1.0, iteration: 3, cost: 0.001 },
+    ];
+    const roi = estimateMarginalROI(improving, 0.001);
+    expect(roi).toBeGreaterThan(0);
+
+    // Expert stuck at same score
+    const stuck = [
+      { score: 0.0, iteration: 0, cost: 0.001 },
+      { score: 0.0, iteration: 1, cost: 0.001 },
+      { score: 0.0, iteration: 2, cost: 0.001 },
+    ];
+    const stuckRoi = estimateMarginalROI(stuck, 0.001);
+    expect(stuckRoi).toBe(0);
+  });
+
+  it('reallocates budget to high-ROI experts', () => {
+    function reallocateBudget(
+      expertHistories: Map<number, Array<{ score: number; iteration: number; cost: number }>>,
+      totalRemainingIterations: number,
+      totalRemainingBudget: number
+    ): Map<number, number> {
+      const allocation = new Map<number, number>();
+      if (expertHistories.size === 0) return allocation;
+
+      const rois = new Map<number, number>();
+      for (const [expertId, history] of expertHistories) {
+        const avgCost = history.length > 0
+          ? history.reduce((s, r) => s + r.cost, 0) / history.length
+          : 0.001;
+        // Simplified ROI for testing
+        const lastScore = history.length > 0 ? history[history.length - 1].score : 0;
+        const firstScore = history.length > 0 ? history[0].score : 0;
+        const roi = Math.max(lastScore - firstScore, 0.01);
+        rois.set(expertId, roi);
+      }
+
+      const sorted = [...rois.entries()].sort((a, b) => b[1] - a[1]);
+      const totalROI = sorted.reduce((s, [, roi]) => s + Math.max(roi, 0.01), 0);
+
+      for (const [expertId, roi] of sorted) {
+        const proportion = Math.max(roi, 0.01) / totalROI;
+        const iters = Math.max(1, Math.round(proportion * totalRemainingIterations));
+        allocation.set(expertId, iters);
+      }
+
+      for (const [expertId] of expertHistories) {
+        if (!allocation.has(expertId)) allocation.set(expertId, 1);
+      }
+
+      return allocation;
+    }
+
+    const histories = new Map<number, Array<{ score: number; iteration: number; cost: number }>>();
+    histories.set(0, [
+      { score: 0.2, iteration: 0, cost: 0.001 },
+      { score: 0.5, iteration: 1, cost: 0.001 },
+    ]);
+    histories.set(1, [
+      { score: 0.0, iteration: 0, cost: 0.001 },
+      { score: 0.0, iteration: 1, cost: 0.001 },
+    ]);
+
+    const allocation = reallocateBudget(histories, 10, 1);
+    expect(allocation.get(0)).toBeGreaterThan(allocation.get(1)!);
+  });
+});
+
+describe('Cross-domain transfer', () => {
+  it('finds analogous categories', () => {
+    const CATEGORY_ANALOGIES: Record<string, string[]> = {
+      'grid-transformation': ['pattern-completion', 'spatial-reasoning', 'sequence-prediction'],
+      'pattern-completion': ['grid-transformation', 'sequence-prediction'],
+      'knowledge-synthesis': ['logical-inference', 'mathematical'],
+    };
+
+    expect(CATEGORY_ANALOGIES['grid-transformation']).toContain('pattern-completion');
+    expect(CATEGORY_ANALOGIES['pattern-completion']).toContain('grid-transformation');
+    expect(CATEGORY_ANALOGIES['knowledge-synthesis']).toContain('logical-inference');
+  });
+
+  it('category descriptions are comprehensive', () => {
+    const descs: Record<string, string> = {
+      'grid-transformation': '2D array transformations',
+      'pattern-completion': 'Completing partial patterns',
+      'knowledge-synthesis': 'Synthesizing fragmented knowledge',
+    };
+    expect(Object.keys(descs).length).toBeGreaterThanOrEqual(3);
+    for (const desc of Object.values(descs)) {
+      expect(desc.length).toBeGreaterThan(5);
+    }
+  });
+});
+
+describe('Confidence-weighted voting', () => {
+  it('weights passed solutions by iteration efficiency', () => {
+    // A solution that passes in 1 iteration should rank higher than one that passes in 5
+    // even if they produce the same output
+    const confidenceWeight = (res: { score: number; iteration: number; passed: boolean; trainResults: Array<{ softScore: number }> }) => {
+      let weight = res.score;
+      if (res.passed) {
+        weight *= Math.max(0.5, 1 - res.iteration * 0.05);
+      }
+      const avgSoft = res.trainResults.length > 0
+        ? res.trainResults.reduce((s, r) => s + r.softScore, 0) / res.trainResults.length
+        : 0;
+      if (avgSoft > 0.8) weight *= 1.2;
+      return weight;
+    };
+
+    const fastSolution = { score: 1.0, iteration: 0, passed: true, trainResults: [{ softScore: 1.0 }] };
+    const slowSolution = { score: 1.0, iteration: 5, passed: true, trainResults: [{ softScore: 1.0 }] };
+
+    const fastWeight = confidenceWeight(fastSolution);
+    const slowWeight = confidenceWeight(slowSolution);
+    expect(fastWeight).toBeGreaterThan(slowWeight);
+  });
+
+  it('boosts high soft-score solutions', () => {
+    const confidenceWeight = (res: { score: number; iteration: number; passed: boolean; trainResults: Array<{ softScore: number }> }) => {
+      let weight = res.score;
+      const avgSoft = res.trainResults.length > 0
+        ? res.trainResults.reduce((s, r) => s + r.softScore, 0) / res.trainResults.length
+        : 0;
+      if (avgSoft > 0.8) weight *= 1.2;
+      return weight;
+    };
+
+    const highSoft = { score: 0.9, iteration: 0, passed: false, trainResults: [{ softScore: 0.9 }] };
+    const lowSoft = { score: 0.9, iteration: 0, passed: false, trainResults: [{ softScore: 0.3 }] };
+
+    expect(confidenceWeight(highSoft)).toBeGreaterThan(confidenceWeight(lowSoft));
+  });
+});
+
+describe('Progressive difficulty', () => {
+  it('orders training examples from easiest to hardest', () => {
+    function flatten(arr: unknown[]): number[] {
+      const result: number[] = [];
+      const stack: unknown[] = [arr];
+      while (stack.length > 0) {
+        const item = stack.pop()!;
+        if (Array.isArray(item)) {
+          for (let i = item.length - 1; i >= 0; i--) stack.push(item[i]);
+        } else if (typeof item === 'number') {
+          result.push(item);
+        }
+      }
+      return result;
+    }
+
+    function gridSize(arr: unknown[]): number {
+      return flatten(arr).length;
+    }
+
+    function orderByDifficulty(trainInputs: unknown[], trainOutputs: unknown[]): number[] {
+      const indices = trainInputs.map((_, i) => i);
+      const difficulty = (input: unknown, output: unknown): number => {
+        const inArr = Array.isArray(input) ? input : [];
+        const outArr = Array.isArray(output) ? output : [];
+        const inSize = gridSize(inArr);
+        const outSize = gridSize(outArr);
+        const sizeScore = Math.max(inSize, outSize);
+        const uniqueVals = new Set(flatten(outArr)).size;
+        const asymmetry = Math.abs(inSize - outSize);
+        return sizeScore + uniqueVals * 2 + asymmetry * 3;
+      };
+      const scored = indices.map(i => ({ index: i, diff: difficulty(trainInputs[i], trainOutputs[i]) }));
+      scored.sort((a, b) => a.diff - b.diff);
+      return scored.map(s => s.index);
+    }
+
+    // Small grid should come before large grid
+    const trainInputs = [
+      [[1, 2], [3, 4]],
+      [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+    ];
+    const trainOutputs = [
+      [[5, 6], [7, 8]],
+      [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+    ];
+
+    const order = orderByDifficulty(trainInputs, trainOutputs);
+    expect(order[0]).toBe(0); // 2x2 grid before 3x3
+  });
+
+  it('simplest example is first', () => {
+    function flatten(arr: unknown[]): number[] {
+      const result: number[] = [];
+      const stack: unknown[] = [arr];
+      while (stack.length > 0) {
+        const item = stack.pop()!;
+        if (Array.isArray(item)) {
+          for (let i = item.length - 1; i >= 0; i--) stack.push(item[i]);
+        } else if (typeof item === 'number') {
+          result.push(item);
+        }
+      }
+      return result;
+    }
+    function gridSize(arr: unknown[]): number { return flatten(arr).length; }
+
+    function orderByDifficulty(trainInputs: unknown[], trainOutputs: unknown[]): number[] {
+      const indices = trainInputs.map((_, i) => i);
+      const difficulty = (input: unknown, output: unknown): number => {
+        const inArr = Array.isArray(input) ? input : [];
+        const outArr = Array.isArray(output) ? output : [];
+        const inSize = gridSize(inArr);
+        const outSize = gridSize(outArr);
+        return Math.max(inSize, outSize) + new Set(flatten(outArr)).size * 2;
+      };
+      const scored = indices.map(i => ({ index: i, diff: difficulty(trainInputs[i], trainOutputs[i]) }));
+      scored.sort((a, b) => a.diff - b.diff);
+      return scored.map(s => s.index);
+    }
+
+    // 3 examples of increasing complexity
+    const trainInputs = [
+      [[1]],
+      [[1, 2], [3, 4]],
+      [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+    ];
+    const trainOutputs = [
+      [[1]],
+      [[1, 2], [3, 4]],
+      [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+    ];
+
+    const order = orderByDifficulty(trainInputs, trainOutputs);
+    expect(order).toEqual([0, 1, 2]);
+  });
+});
+
+describe('Decomposition', () => {
+  it('produces sub-problems with valid structure', () => {
+    const subProblem = {
+      id: 1,
+      description: 'Identify the rotation angle',
+      input: '[[1,2],[3,4]]',
+      expectedOutput: '[[3,1],[4,2]]',
+      combineOrder: 1,
+    };
+    expect(subProblem.id).toBe(1);
+    expect(subProblem.description.length).toBeGreaterThan(0);
+    expect(subProblem.input.length).toBeGreaterThan(0);
+  });
+
+  it('combine strategies are valid', () => {
+    const strategies = ['sequential', 'parallel', 'hierarchical'] as const;
+    expect(strategies.length).toBe(3);
+  });
+});

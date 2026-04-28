@@ -1177,9 +1177,1246 @@ async function maybeAutoImprove(
   return { improved: true, reason, childId: child.id };
 }
 
-// =============================================================================
+// ===========================================================================
+// Layer 6: Recursive Harness Generation — the "solver of solvers"
+//
+// Poetiq's open-source code shows ONE harness config with fixed prompts.
+// Their blog results (SOTA on ARC + HLE simultaneously) prove they generate
+// MULTIPLE different harness configurations per problem type.
+//
+// This layer implements HarnessSpec — a complete specification for a solve
+// approach, including: solve strategy, verification method, decomposition,
+// feedback format, iteration pattern, and model preferences.
+//
+// The meta-system generates multiple specs per problem, validates them on
+// held-out data, and evolves the best ones over time.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// HarnessSpec types
+// ---------------------------------------------------------------------------
+
+type ApproachType =
+  | 'code-sandbox'     // Generate JS code, execute in sandbox, verify output
+  | 'code-direct'      // Generate code, return answer directly (no sandbox)
+  | 'decomposition'    // Break into sub-problems, solve each, combine
+  | 'chain-of-questions' // Hierarchical probing (for knowledge tasks)
+  | 'analogy'          // Solve a simpler analogous problem first
+  | 'counter-factual'  // Generate what NOT to do, then invert
+  | 'exhaustive-search'; // Enumerate all possibilities, filter
+
+interface HarnessSpec {
+  id: string;
+  /** Problem category this spec targets */
+  category: string;
+  /** The approach type */
+  approach: ApproachType;
+  /** Solver prompt template (with $$problem$$ placeholder) */
+  solverPrompt: string;
+  /** Feedback prompt template (with $$feedback$$ placeholder) */
+  feedbackPrompt: string;
+  /** ExpertConfig overrides */
+  configOverrides: Partial<ExpertConfig>;
+  /** Decomposition config (for approach='decomposition') */
+  decomposition?: {
+    maxSubProblems: number;
+    maxDepth: number;
+    combineStrategy: 'sequential' | 'parallel' | 'hierarchical';
+  };
+  /** Validation score on held-out data [0-1] */
+  validationScore: number;
+  /** Number of validation tests run */
+  validationTests: number;
+  /** Whether this spec has been validated */
+  validated: boolean;
+  /** Lineage */
+  parentId: string | null;
+  generation: number;
+  /** When this spec was created */
+  created: number;
+  /** Number of times used in production */
+  useCount: number;
+  /** Number of production successes */
+  successCount: number;
+  /** Average production score */
+  avgScore: number;
+}
+
+const HARNESS_SPECS_PATH = process.env.PI_REASON_HARNESS_SPECS ??
+  join(process.env.HOME || '/tmp', '.pi-reason-harness', 'harness-specs.json');
+
+let harnessSpecs: HarnessSpec[] = [];
+let harnessSpecsLoaded = false;
+
+function loadHarnessSpecs(): HarnessSpec[] {
+  if (harnessSpecsLoaded) return harnessSpecs;
+  harnessSpecs = loadJSON(HARNESS_SPECS_PATH, []);
+  harnessSpecsLoaded = true;
+  return harnessSpecs;
+}
+
+function saveHarnessSpecs(): void {
+  saveJSON(HARNESS_SPECS_PATH, harnessSpecs);
+}
+
+// ---------------------------------------------------------------------------
+// Spec generation — LLM proposes multiple harness configs
+// ---------------------------------------------------------------------------
+
+const SPEC_GENERATOR_PROMPT = `You are a meta-reasoning expert. Given a problem, propose MULTIPLE different solve approaches. Each approach represents a fundamentally different strategy for solving the problem, not just a prompt tweak.
+
+## Problem
+$$problem$$
+
+## Available Approaches
+1. code-sandbox: Write JS code, execute in Node vm sandbox, verify output matches expected
+2. code-direct: Write JS code, extract the answer directly (no execution)
+3. decomposition: Break into sub-problems, solve each independently, combine
+4. chain-of-questions: Hierarchical probing — start broad, narrow down (for knowledge tasks)
+5. analogy: Solve a simpler version of the problem first, then scale up
+6. counter-factual: Generate incorrect solutions, analyze why they fail, invert
+7. exhaustive-search: Enumerate possible transformations, filter by constraints
+
+## Your Task
+Propose 3-5 different HarnessSpecs for this problem. For each, specify the approach, a complete solver prompt with $$problem$$ placeholder, a feedback prompt with $$feedback$$ placeholder, and config overrides.
+
+Key principles:
+- Each spec should use a DIFFERENT approach
+- For grid/array problems: code-sandbox is primary, but also try decomposition (separate rows/columns) and analogy (simpler grid first)
+- For knowledge questions: chain-of-questions is primary, but also try decomposition and counter-factual
+- For mathematical problems: code-sandbox + exhaustive-search + decomposition
+- Prompts must be COMPREHENSIVE (not terse 1-liners) — include step-by-step instructions
+- Each prompt MUST include $$problem$$ as the placeholder for the problem text
+
+Respond in EXACT JSON format (no markdown, no backticks, just raw JSON):
+{
+  "specs": [
+    {
+      "approach": "code-sandbox",
+      "solverPrompt": "Complete prompt with $$problem$$ placeholder...",
+      "feedbackPrompt": "Complete feedback prompt with $$feedback$$ placeholder...",
+      "configOverrides": { "temperature": 1.0, "maxIterations": 10, "reasoning": "high" },
+      "decomposition": null
+    },
+    {
+      "approach": "decomposition",
+      "solverPrompt": "...",
+      "feedbackPrompt": "...",
+      "configOverrides": { "temperature": 0.7, "maxIterations": 8 },
+      "decomposition": { "maxSubProblems": 3, "maxDepth": 2, "combineStrategy": "sequential" }
+    }
+  ]
+}`;
+
+async function generateHarnessSpecs(
+  problem: string,
+  category: string,
+  modelId: string
+): Promise<HarnessSpec[]> {
+  const prompt = SPEC_GENERATOR_PROMPT.replace('$$problem$$', problem.slice(0, 4000));
+  const result = await callLLM(modelId, prompt, 0.5, 120, 1, 'high');
+
+  try {
+    let content = result.content.trim();
+    const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (jsonMatch) content = jsonMatch[1].trim();
+    const parsed = JSON.parse(content);
+
+    if (!Array.isArray(parsed.specs)) return [];
+
+    return parsed.specs
+      .filter((s: any) => s.approach && s.solverPrompt && s.solverPrompt.includes('$$problem$$'))
+      .map((s: any): HarnessSpec => ({
+        id: randomBytes(4).toString('hex'),
+        category,
+        approach: s.approach as ApproachType,
+        solverPrompt: s.solverPrompt,
+        feedbackPrompt: s.feedbackPrompt || CODE_REASONING_FEEDBACK,
+        configOverrides: s.configOverrides || {},
+        decomposition: s.decomposition || undefined,
+        validationScore: 0,
+        validationTests: 0,
+        validated: false,
+        parentId: null,
+        generation: 0,
+        created: Date.now(),
+        useCount: 0,
+        successCount: 0,
+        avgScore: 0,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Spec validation — test on held-out data before promoting
+// ---------------------------------------------------------------------------
+
+async function validateHarnessSpec(
+  spec: HarnessSpec,
+  trainInputs: unknown[],
+  trainOutputs: unknown[],
+  modelId: string,
+  maxTests: number = 2
+): Promise<{ validated: boolean; score: number; tests: number }> {
+  // Use last training examples as held-out (don't use first N, which the solver will see)
+  const n = Math.min(maxTests, Math.max(1, Math.floor(trainInputs.length / 2)));
+  const heldOutStart = Math.max(0, trainInputs.length - n);
+  const heldInInputs = trainInputs.slice(0, heldOutStart);
+  const heldInOutputs = trainOutputs.slice(0, heldOutStart);
+  const heldOutInputs = trainInputs.slice(heldOutStart);
+  const heldOutOutputs = trainOutputs.slice(heldOutStart);
+
+  if (heldOutInputs.length === 0 || heldInInputs.length === 0) {
+    // Not enough data for held-out validation — mark as conditionally validated
+    spec.validated = true;
+    spec.validationScore = -1; // sentinel: not enough data
+    spec.validationTests = 0;
+    return { validated: true, score: -1, tests: 0 };
+  }
+
+  // Run 1 iteration with this spec on the held-in data, test on held-out
+  const problem = formatProblem(
+    heldInInputs as number[][][],
+    heldInOutputs as number[][][],
+    heldOutInputs as number[][][],
+    true, 0
+  );
+
+  const message = spec.solverPrompt.replace('$$problem$$', problem);
+  const llmResult = await callLLM(modelId, message, spec.configOverrides.temperature ?? 1.0, 120, 1, spec.configOverrides.reasoning ?? 'off');
+
+  const code = parseCodeFromLLM(llmResult.content);
+  let score = 0;
+  let tests = 0;
+
+  if (code && spec.approach === 'code-sandbox') {
+    for (let i = 0; i < heldOutInputs.length; i++) {
+      const sandboxResult = await runInSandbox(code, heldOutInputs[i], spec.configOverrides.sandboxTimeout ?? 5);
+      const success = sandboxResult.ok && compareOutputs(sandboxResult.output, heldOutOutputs[i]);
+      if (success) score += 1;
+      tests++;
+    }
+  }
+
+  const avgScore = tests > 0 ? score / tests : 0;
+  spec.validationScore = avgScore;
+  spec.validationTests = tests;
+  spec.validated = true;
+
+  return { validated: avgScore >= 0.5 || tests === 0, score: avgScore, tests };
+}
+
+// ---------------------------------------------------------------------------
+// Spec selection — pick the best spec for a problem
+// ---------------------------------------------------------------------------
+
+function selectBestSpec(
+  category: string,
+  approachHint?: ApproachType
+): HarnessSpec | null {
+  loadHarnessSpecs();
+  const candidates = harnessSpecs
+    .filter((s) => s.category === category)
+    .filter((s) => s.validated)
+    .filter((s) => !approachHint || s.approach === approachHint);
+
+  if (candidates.length === 0) return null;
+
+  // Thompson sampling: prefer validated specs with high scores,
+  // but explore under-tested specs
+  return candidates.sort((a, b) => {
+    // Prioritize: validated > untested, then by score, then by uses
+    const aTested = a.validationTests > 0;
+    const bTested = b.validationTests > 0;
+    if (aTested && !bTested) return -1;
+    if (!aTested && bTested) return 1;
+
+    const aScore = aTested ? a.validationScore : a.avgScore;
+    const bScore = bTested ? b.validationScore : b.avgScore;
+
+    // Add exploration bonus for under-tested specs
+    const aExploration = a.useCount < 3 ? 0.1 : 0;
+    const bExploration = b.useCount < 3 ? 0.1 : 0;
+
+    return (bScore + bExploration) - (aScore + aExploration);
+  })[0];
+}
+
+/** Find best spec per approach type (for ensemble diversification) */
+function selectSpecsByApproach(
+  category: string,
+  numExperts: number
+): HarnessSpec[] {
+  loadHarnessSpecs();
+  const validated = harnessSpecs.filter((s) => s.category === category && s.validated);
+
+  if (validated.length === 0) return [];
+
+  // Group by approach, pick best from each group
+  const byApproach = new Map<ApproachType, HarnessSpec[]>();
+  for (const s of validated) {
+    const group = byApproach.get(s.approach) || [];
+    group.push(s);
+    byApproach.set(s.approach, group);
+  }
+
+  // Sort approaches by best spec score
+  const approachOrder = [...byApproach.entries()]
+    .map(([approach, specs]) => ({
+      approach,
+      bestScore: Math.max(...specs.map((s) => s.validationScore >= 0 ? s.validationScore : s.avgScore)),
+      spec: specs.sort((a, b) => {
+        const sa = a.validationScore >= 0 ? a.validationScore : a.avgScore;
+        const sb = b.validationScore >= 0 ? b.validationScore : b.avgScore;
+        return sb - sa;
+      })[0],
+    }))
+    .sort((a, b) => b.bestScore - a.bestScore);
+
+  return approachOrder.slice(0, numExperts).map((a) => a.spec);
+}
+
+// ---------------------------------------------------------------------------
+// Harness spec evolution — mutate and validate
+// ---------------------------------------------------------------------------
+
+const SPEC_EVOLVER_PROMPT = `You are a meta-reasoning expert. Below is a harness specification with its validation results. Your job is to generate an IMPROVED version.
+
+## Current Spec
+Approach: $$approach$$ | Category: $$category$$ | Generation: $$generation$$
+Solver prompt (excerpt):
+$$solverPrompt$$
+Config overrides: $$configOverrides$$
+Decomposition: $$decomposition$$
+
+## Validation Results
+Validation score: $$validationScore$$ (tests: $$validationTests$$)
+Production: uses=$$useCount$$ successes=$$successCount$$ avgScore=$$avgScore$$
+
+## Active Meta-Rules
+$$metaRules$$
+
+---
+
+Generate an improved harness spec. Rules:
+- If validation score is low: the APPROACH may be wrong — try a different approach type
+- If validation score is high but production score is low: the spec overfits — generalize the prompt
+- If both are low: radically redesign the prompt
+- Apply relevant meta-rules
+- solverPrompt MUST include $$problem$$ placeholder
+- feedbackPrompt MUST include $$feedback$$ placeholder
+
+Respond in EXACT JSON format:
+{
+  "approach": "same-or-different-approach",
+  "solverPrompt": "improved prompt with $$problem$$...",
+  "feedbackPrompt": "improved feedback prompt with $$feedback$$...",
+  "configOverrides": { ... },
+  "decomposition": null or { "maxSubProblems": N, "maxDepth": N, "combineStrategy": "sequential|parallel|hierarchical" },
+  "rationale": "what you changed and why"
+}`;
+
+async function evolveHarnessSpec(
+  parent: HarnessSpec,
+  modelId: string
+): Promise<HarnessSpec | null> {
+  loadMetaRules();
+  const rulesStr = metaRules
+    .filter((r) => r.improvementCount > 0 || r.testCount < 3)
+    .slice(0, 5)
+    .map((r) => `  - "${r.principle}" (improvements: ${r.improvementCount}/${r.testCount})`)
+    .join('\n') || '  (none yet)';
+
+  const prompt = SPEC_EVOLVER_PROMPT
+    .replace('$$approach$$', parent.approach)
+    .replace('$$category$$', parent.category)
+    .replace('$$generation$$', String(parent.generation))
+    .replace('$$solverPrompt$$', parent.solverPrompt.slice(0, 2000))
+    .replace('$$configOverrides$$', JSON.stringify(parent.configOverrides))
+    .replace('$$decomposition$$', JSON.stringify(parent.decomposition || null))
+    .replace('$$validationScore$$', parent.validationScore.toFixed(3))
+    .replace('$$validationTests$$', String(parent.validationTests))
+    .replace('$$useCount$$', String(parent.useCount))
+    .replace('$$successCount$$', String(parent.successCount))
+    .replace('$$avgScore$$', parent.avgScore.toFixed(3))
+    .replace('$$metaRules$$', rulesStr);
+
+  const result = await callLLM(modelId, prompt, 0.5, 120, 1, 'high');
+
+  try {
+    let content = result.content.trim();
+    const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (jsonMatch) content = jsonMatch[1].trim();
+    const parsed = JSON.parse(content);
+
+    if (!parsed.solverPrompt || !parsed.solverPrompt.includes('$$problem$$')) return null;
+
+    const child: HarnessSpec = {
+      id: randomBytes(4).toString('hex'),
+      category: parent.category,
+      approach: parsed.approach || parent.approach,
+      solverPrompt: parsed.solverPrompt,
+      feedbackPrompt: parsed.feedbackPrompt || parent.feedbackPrompt,
+      configOverrides: parsed.configOverrides || {},
+      decomposition: parsed.decomposition || undefined,
+      validationScore: 0,
+      validationTests: 0,
+      validated: false,
+      parentId: parent.id,
+      generation: parent.generation + 1,
+      created: Date.now(),
+      useCount: 0,
+      successCount: 0,
+      avgScore: 0,
+    };
+
+    return child;
+  } catch {
+    return null;
+  }
+}
+
+// ===========================================================================
+// Layer 7: Ensemble Diversification — different approach per expert
+//
+// Instead of N experts with the same prompt (just different seeds/models),
+// each expert uses a FUNDAMENTALLY DIFFERENT approach:
+// Expert 1: code-sandbox (the workhorse)
+// Expert 2: decomposition (break into sub-problems)
+// Expert 3: analogy (solve simpler version first)
+// ===========================================================================
+
+const APPROACH_SOLVER_PROMPTS: Record<ApproachType, string> = {
+  'code-sandbox': '', // Uses CODE_REASONING_SOLVER (filled at runtime)
+  'code-direct': `You are a world-class expert in solving problems by writing JavaScript code. Unlike the sandboxed approach, you will reason about the code's output WITHOUT executing it.
+
+For each problem:
+1. Analyze the input-output examples to identify the transformation rule
+2. Write the JavaScript function that implements the rule
+3. MENTALLY EXECUTE the function on each test input
+4. State the expected output directly
+
+Your answer format:
+- Brief explanation of the transformation
+- The JavaScript function
+- **Answer:** [the expected output for the test input]
+
+$$problem$$`,
+
+  'decomposition': `You are a world-class expert in solving complex problems by DECOMPOSITION.
+
+Strategy:
+1. Break the problem into independent sub-problems
+2. Solve each sub-problem separately
+3. Combine the sub-solutions into the final answer
+
+For grid transformations, decompose by:
+- Rows vs columns
+- Individual elements vs patterns
+- Shape changes vs value changes
+- Foreground vs background elements
+
+For knowledge questions, decompose by:
+- What facts are needed?
+- What reasoning steps are required?
+- What constraints must be satisfied?
+
+Write JavaScript code for each sub-problem, then combine.
+
+$$problem$$`,
+
+  'chain-of-questions': `You are a world-class expert in answering questions through SYSTEMATIC PROBING.
+
+Your strategy: Build a HIERARCHY of questions from broad to specific:
+1. BROAD: What domain/field does this question relate to?
+2. NARROW: What specific concept within that domain?
+3. PRECISE: What is the exact fact/value/date/name?
+4. VERIFY: Cross-reference with another angle
+
+For each level, state your reasoning before giving the answer.
+Confidence bucketing: HIGH (verified from 2+ angles), MEDIUM (plausible), LOW (speculative).
+
+$$problem$$`,
+
+  'analogy': `You are a world-class expert in solving problems by ANALOGY.
+
+Strategy:
+1. First, solve a SIMPLER version of the problem (e.g., smaller grid, fewer elements)
+2. Identify the transformation rule on the simpler version
+3. Verify the rule works on all training examples
+4. Apply the rule to the test input
+
+The key insight: complex problems often follow simple rules that are easier to see in smaller cases.
+
+Write JavaScript code for both the simple and full versions.
+
+$$problem$$`,
+
+  'counter-factual': `You are a world-class expert in solving problems through NEGATIVE REASONING.
+
+Strategy:
+1. Generate 2-3 PLAUSIBLE BUT WRONG solutions
+2. For each wrong solution, explain WHY it fails
+3. From the failure patterns, deduce what the CORRECT approach must be
+4. Implement the correct approach
+
+This works because understanding failures reveals the true constraints.
+
+Write JavaScript code implementing the deduced correct approach.
+
+$$problem$$`,
+
+  'exhaustive-search': `You are a world-class expert in solving problems through EXHAUSTIVE ENUMERATION.
+
+Strategy:
+1. List ALL possible transformation types that could apply
+2. For each type, check if it's consistent with ALL training examples
+3. Filter out inconsistent transformations
+4. Test remaining candidates on held-out examples
+5. Output the surviving candidate's result
+
+This is systematic but thorough — you leave no stone unturned.
+Write JavaScript code that implements the surviving transformation.
+
+$$problem$$`,
+};
+
+/** Generate diverse expert configs — each expert gets a different approach */
+function generateDiverseExpertConfigs(
+  baseConfig: TaskConfig,
+  problemFeatures: ProblemFeatures | null,
+  adaptations: StrategyAdaptation[],
+  harnessSpecsByApproach: HarnessSpec[]
+): ExpertConfig[] {
+  const experts: ExpertConfig[] = [];
+  const numExperts = baseConfig.numExperts || 1;
+
+  // Determine which approaches to use
+  let approaches: ApproachType[] = [];
+
+  if (harnessSpecsByApproach.length > 0) {
+    // Use validated harness specs
+    approaches = harnessSpecsByApproach.map((s) => s.approach);
+  } else if (baseConfig.type === 'code-reasoning') {
+    // Default diverse set for code-reasoning
+    approaches = ['code-sandbox', 'decomposition', 'analogy'];
+  } else if (baseConfig.type === 'knowledge-extraction') {
+    approaches = ['chain-of-questions', 'decomposition', 'counter-factual'];
+  } else {
+    approaches = ['code-sandbox', 'chain-of-questions', 'decomposition'];
+  }
+
+  // Trim/fill to match numExperts
+  while (approaches.length < numExperts) {
+    approaches.push(approaches[approaches.length % approaches.length]);
+  }
+  approaches = approaches.slice(0, numExperts);
+
+  for (let i = 0; i < numExperts; i++) {
+    const approach = approaches[i];
+    const spec = i < harnessSpecsByApproach.length ? harnessSpecsByApproach[i] : null;
+    const model = baseConfig.models[i % baseConfig.models.length] || 'openai/gpt-4o';
+
+    // Get the solver prompt for this approach
+    let solverPrompt: string;
+    if (spec) {
+      solverPrompt = spec.solverPrompt;
+    } else if (approach === 'code-sandbox') {
+      solverPrompt = CODE_REASONING_SOLVER;
+    } else {
+      const template = APPROACH_SOLVER_PROMPTS[approach];
+      solverPrompt = template || CODE_REASONING_SOLVER;
+    }
+
+    // Apply delta from problem features if available
+    if (problemFeatures) {
+      const metaRuleDelta = applyMetaRules(problemFeatures.category, problemFeatures.difficulty);
+      const combinedDelta: PromptDelta = {
+        preProblemInsert: [
+          metaRuleDelta.preProblemInsert,
+          problemFeatures.promptDelta.preProblemInsert
+        ].filter(Boolean).join('\n') || null,
+        postProblemInsert: [
+          metaRuleDelta.postProblemInsert,
+          problemFeatures.promptDelta.postProblemInsert
+        ].filter(Boolean).join('\n') || null,
+        sectionReplacements: {
+          ...metaRuleDelta.sectionReplacements,
+          ...problemFeatures.promptDelta.sectionReplacements,
+        },
+        additionalExamples: [
+          ...metaRuleDelta.additionalExamples,
+          ...problemFeatures.promptDelta.additionalExamples,
+        ],
+        antiPatterns: [
+          ...metaRuleDelta.antiPatterns,
+          ...problemFeatures.promptDelta.antiPatterns,
+        ],
+      };
+      solverPrompt = applyPromptDelta(solverPrompt, combinedDelta);
+    }
+
+    // Apply learned adaptations
+    let promptModifier = '';
+    for (const adaptation of adaptations) {
+      if (adaptation.taskType === baseConfig.type || adaptation.taskType === '*') {
+        promptModifier += '\n\n' + adaptation.promptModifier;
+      }
+    }
+    if (promptModifier) solverPrompt += promptModifier;
+
+    const requiresCode = approach !== 'chain-of-questions';
+    const configOverride = spec?.configOverrides || {};
+
+    experts.push({
+      solverPrompt,
+      feedbackPrompt: spec?.feedbackPrompt ||
+        (approach === 'code-sandbox' ? CODE_REASONING_FEEDBACK :
+         approach === 'chain-of-questions' ? KNOWLEDGE_EXTRACTION_FEEDBACK :
+         HYBRID_FEEDBACK),
+      llmId: model,
+      temperature: configOverride.temperature ?? 1.0,
+      maxIterations: configOverride.maxIterations ??
+        (approach === 'decomposition' ? 8 : 10),
+      maxSolutions: 5,
+      selectionProbability: 1.0,
+      seed: i * 100,
+      shuffleExamples: true,
+      improvingOrder: true,
+      returnBestResult: true,
+      requestTimeout: 3600,
+      maxTotalTimeouts: 15,
+      perIterationRetries: 2,
+      sandboxTimeout: requiresCode ? 5 : 0,
+      requiresCode,
+      reasoning: configOverride.reasoning ??
+        (problemFeatures?.suggestedReasoning ?? 'off'),
+      voting: {
+        useNewVoting: true,
+        countFailedMatches: true,
+        itersTiebreak: false,
+        lowToHighIters: false,
+      },
+    });
+  }
+
+  return experts;
+}
+
+// ===========================================================================
+// Layer 8: Sub-problem Decomposition
+//
+// For hard problems, decompose into sub-problems and solve each
+// independently. This is how Poetiq handles ARC's hardest puzzles —
+// they don't try to solve the whole thing at once.
+// ===========================================================================
+
+const DECOMPOSER_PROMPT = `You are a meta-reasoning expert. Decompose the following problem into independent sub-problems that can each be solved separately.
+
+## Problem
+$$problem$$
+
+## Decomposition Rules
+1. Each sub-problem should be independently solvable
+2. Sub-problems should be simpler than the original
+3. Combining the sub-solutions should yield the final answer
+4. For grid problems: decompose by spatial regions, value groups, or operation stages
+5. For knowledge questions: decompose by required facts, reasoning steps, or constraints
+6. Maximum 4 sub-problems
+7. Each sub-problem should have a clear input and expected output
+
+Respond in EXACT JSON format (no markdown, no backticks, just raw JSON):
+{
+  "subProblems": [
+    {
+      "id": 1,
+      "description": "What this sub-problem solves",
+      "input": "The input for this sub-problem",
+      "expectedOutput": "What the output should look like",
+      "combineOrder": 1
+    }
+  ],
+  "combineStrategy": "sequential|parallel|hierarchical",
+  "combinePrompt": "How to combine the sub-solutions into the final answer"
+}`;
+
+interface SubProblem {
+  id: number;
+  description: string;
+  input: string;
+  expectedOutput: string;
+  combineOrder: number;
+}
+
+interface Decomposition {
+  subProblems: SubProblem[];
+  combineStrategy: 'sequential' | 'parallel' | 'hierarchical';
+  combinePrompt: string;
+}
+
+async function decomposeProblem(
+  problem: string,
+  modelId: string
+): Promise<Decomposition | null> {
+  const prompt = DECOMPOSER_PROMPT.replace('$$problem$$', problem.slice(0, 4000));
+  const result = await callLLM(modelId, prompt, 0.3, 60, 1, 'high');
+
+  try {
+    let content = result.content.trim();
+    const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (jsonMatch) content = jsonMatch[1].trim();
+    const parsed = JSON.parse(content);
+
+    if (!Array.isArray(parsed.subProblems) || parsed.subProblems.length === 0) return null;
+
+    return {
+      subProblems: parsed.subProblems.map((s: any) => ({
+        id: s.id || 0,
+        description: s.description || '',
+        input: s.input || '',
+        expectedOutput: s.expectedOutput || '',
+        combineOrder: s.combineOrder || 0,
+      })),
+      combineStrategy: parsed.combineStrategy || 'sequential',
+      combinePrompt: parsed.combinePrompt || 'Combine the sub-solutions in order.',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Solve a decomposed problem by solving each sub-problem independently */
+async function solveWithDecomposition(
+  session: SessionState,
+  decomposition: Decomposition,
+  modelId: string,
+  budget: { maxCost?: number; maxTime?: number; startTime: number; costSoFar: number },
+  verification: TaskConfig['verification'],
+  verifyCommand: string | undefined
+): Promise<{ combinedAnswer: string; subResults: string[]; score: number }> {
+  const subResults: string[] = [];
+  let totalCost = 0;
+
+  // Sort sub-problems by combineOrder
+  const sorted = [...decomposition.subProblems].sort((a, b) => a.combineOrder - b.combineOrder);
+
+  for (const sub of sorted) {
+    if (budget.maxCost && totalCost >= budget.maxCost) break;
+    if (budget.maxTime && (Date.now() - budget.startTime) / 1000 >= budget.maxTime) break;
+
+    const subPrompt = `Sub-problem #${sub.id}: ${sub.description}\n\nInput: ${sub.input}\n\n${CODE_REASONING_SOLVER.replace('$$problem$$', sub.input)}`;
+    const result = await callLLM(modelId, subPrompt, 0.7, 120, 1, 'high');
+    totalCost += result.cost;
+
+    const code = parseCodeFromLLM(result.content);
+    const answer = code
+      ? `Sub-problem ${sub.id} code: ${code}`
+      : `Sub-problem ${sub.id} answer: ${parseAnswerFromLLM(result.content)}`;
+    subResults.push(answer);
+  }
+
+  // Combine sub-solutions
+  const combinePrompt = `${decomposition.combinePrompt}\n\nSub-solutions:\n${subResults.map((r, i) => `${i + 1}. ${r}`).join('\n')}`;
+  const combineResult = await callLLM(modelId, combinePrompt, 0.3, 60, 1, 'high');
+
+  return {
+    combinedAnswer: combineResult.content,
+    subResults,
+    score: 0, // Score is computed by the caller after verification
+  };
+}
+
+// ===========================================================================
+// Layer 9: Budget Optimization via Marginal ROI
+//
+// Not just "stop when stuck" but "spend more where ROI is highest".
+// For each expert, estimate the expected improvement per additional
+// iteration, and reallocate budget accordingly.
+// ===========================================================================
+
+/** Estimate marginal ROI: expected score improvement per additional iteration */
+function estimateMarginalROI(
+  expertHistory: Array<{ score: number; iteration: number; cost: number }>,
+  costPerIteration: number
+): number {
+  if (expertHistory.length < 2) return 1.0; // Unknown = assume positive
+
+  // Compute score improvements over recent iterations
+  const recentWindow = Math.min(5, expertHistory.length);
+  const recent = expertHistory.slice(-recentWindow);
+
+  let totalImprovement = 0;
+  let improvementCount = 0;
+  for (let i = 1; i < recent.length; i++) {
+    const delta = recent[i].score - recent[i - 1].score;
+    if (delta > 0) {
+      totalImprovement += delta;
+      improvementCount++;
+    }
+  }
+
+  // Average improvement per iteration when improvement happens
+  const avgImprovement = improvementCount > 0
+    ? totalImprovement / improvementCount
+    : 0;
+
+  // Estimate probability of improvement (based on recent trend)
+  const pImprove = improvementCount / (recent.length - 1);
+
+  // Expected improvement = P(improve) * avg_improvement
+  const expectedImprovement = pImprove * avgImprovement;
+
+  // ROI = expected improvement / cost per iteration
+  return costPerIteration > 0
+    ? expectedImprovement / costPerIteration
+    : expectedImprovement;
+}
+
+/** Reallocate iterations from low-ROI to high-ROI experts */
+function reallocateBudget(
+  expertHistories: Map<number, Array<{ score: number; iteration: number; cost: number }>>,
+  totalRemainingIterations: number,
+  totalRemainingBudget: number
+): Map<number, number> {
+  const allocation = new Map<number, number>();
+  const rois = new Map<number, number>();
+
+  if (expertHistories.size === 0) return allocation;
+
+  // Calculate ROI for each expert
+  for (const [expertId, history] of expertHistories) {
+    const avgCost = history.length > 0
+      ? history.reduce((s, r) => s + r.cost, 0) / history.length
+      : 0.001;
+    const roi = estimateMarginalROI(history, avgCost);
+    rois.set(expertId, roi);
+  }
+
+  // Sort by ROI (descending)
+  const sorted = [...rois.entries()].sort((a, b) => b[1] - a[1]);
+
+  // Allocate proportionally to ROI
+  const totalROI = sorted.reduce((s, [, roi]) => s + Math.max(roi, 0.01), 0);
+  const basePerExpert = Math.max(1, Math.floor(totalRemainingIterations / sorted.length));
+
+  for (const [expertId, roi] of sorted) {
+    const proportion = Math.max(roi, 0.01) / totalROI;
+    const iters = Math.max(1, Math.round(proportion * totalRemainingIterations));
+    allocation.set(expertId, iters);
+  }
+
+  // Ensure minimum 1 iteration per expert
+  for (const [expertId] of expertHistories) {
+    if (!allocation.has(expertId)) allocation.set(expertId, basePerExpert);
+  }
+
+  return allocation;
+}
+
+// ===========================================================================
+// Layer 10: Cross-Domain Transfer
+//
+// When a strategy works in one domain, explicitly transfer insights
+// to related domains. This is how Poetiq achieves SOTA on both ARC
+// AND HLE — strategies from one domain inform the other.
+// ===========================================================================
+
+/** Category similarity map — which categories share deep structure */
+const CATEGORY_ANALOGIES: Record<string, string[]> = {
+  'grid-transformation': ['pattern-completion', 'spatial-reasoning', 'sequence-prediction'],
+  'pattern-completion': ['grid-transformation', 'sequence-prediction'],
+  'sequence-prediction': ['pattern-completion', 'mathematical', 'logical-inference'],
+  'spatial-reasoning': ['grid-transformation', 'pattern-completion'],
+  'knowledge-synthesis': ['logical-inference', 'mathematical'],
+  'mathematical': ['sequence-prediction', 'logical-inference', 'knowledge-synthesis'],
+  'logical-inference': ['mathematical', 'knowledge-synthesis', 'sequence-prediction'],
+  'code-generation': ['grid-transformation', 'mathematical'],
+  'other': [],
+};
+
+function findAnalogousCategories(category: string): string[] {
+  return CATEGORY_ANALOGIES[category] || [];
+}
+
+const STRATEGY_TRANSFER_PROMPT = `You are a meta-reasoning expert. A strategy has proven effective in the $$sourceCategory$$ domain. Adapt it for the $$targetCategory$$ domain.
+
+## Source Strategy (proven in $$sourceCategory$$)
+$$solverPrompt$$
+Config: $$configOverrides$$
+Score: $$score$$ | Successes: $$successes$$/$$uses$$
+
+## Key Differences Between Domains
+$$sourceCategory$$: $$sourceDescription$$
+$$targetCategory$$: $$targetDescription$$
+
+## Your Task
+Adapt the source strategy's core insights for the target domain. Keep what's universal (structured thinking, verification steps), modify what's domain-specific (grid operations vs. knowledge retrieval, spatial reasoning vs. logical deduction).
+
+The adapted prompt MUST include $$problem$$ placeholder.
+
+Respond in EXACT JSON format:
+{
+  "solverPrompt": "adapted prompt with $$problem$$...",
+  "feedbackPrompt": "adapted feedback prompt with $$feedback$$...",
+  "configOverrides": { ... },
+  "transferredInsights": ["what was kept", "what was modified", "what was added"],
+  "confidence": 0.7
+}`;
+
+async function transferStrategy(
+  sourceStrategy: StrategyEntry,
+  targetCategory: string,
+  modelId: string
+): Promise<StrategyEntry | null> {
+  const sourceDesc = categoryDescription(sourceStrategy.category);
+  const targetDesc = categoryDescription(targetCategory);
+
+  const prompt = STRATEGY_TRANSFER_PROMPT
+    .replace('$$sourceCategory$$', sourceStrategy.category)
+    .replace('$$targetCategory$$', targetCategory)
+    .replace('$$solverPrompt$$', sourceStrategy.solverPrompt.slice(0, 2000))
+    .replace('$$configOverrides$$', JSON.stringify(sourceStrategy.configOverrides))
+    .replace('$$score$$', sourceStrategy.avgScore.toFixed(3))
+    .replace('$$successes$$', String(sourceStrategy.successCount))
+    .replace('$$uses$$', String(sourceStrategy.useCount))
+    .replace('$$sourceDescription$$', sourceDesc)
+    .replace('$$targetDescription$$', targetDesc);
+
+  const result = await callLLM(modelId, prompt, 0.3, 120, 1, 'high');
+
+  try {
+    let content = result.content.trim();
+    const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (jsonMatch) content = jsonMatch[1].trim();
+    const parsed = JSON.parse(content);
+
+    if (!parsed.solverPrompt || !parsed.solverPrompt.includes('$$problem$$')) return null;
+
+    return {
+      id: randomBytes(4).toString('hex'),
+      created: Date.now(),
+      category: targetCategory,
+      solverPrompt: parsed.solverPrompt,
+      feedbackPrompt: parsed.feedbackPrompt || sourceStrategy.feedbackPrompt,
+      configOverrides: parsed.configOverrides || {},
+      appliedDelta: null,
+      useCount: 0,
+      successCount: 0,
+      avgScore: 0,
+      totalCost: 0,
+      totalTime: 0,
+      testedModels: [],
+      parentId: sourceStrategy.id,
+      generation: sourceStrategy.generation + 1,
+      qualityMetrics: { ...DEFAULT_QUALITY },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function categoryDescription(category: string): string {
+  const descs: Record<string, string> = {
+    'grid-transformation': '2D array transformations — spatial patterns, symmetry, rotation, scaling, color mapping',
+    'pattern-completion': 'Completing partial patterns — filling in missing elements based on rules',
+    'sequence-prediction': 'Predicting next elements in sequences — numerical, spatial, or logical',
+    'spatial-reasoning': 'Reasoning about spatial relationships — containment, adjacency, connectivity',
+    'knowledge-synthesis': 'Synthesizing fragmented knowledge — factual recall, cross-referencing, verification',
+    'mathematical': 'Mathematical reasoning — computation, proof, optimization, combinatorics',
+    'logical-inference': 'Deductive and inductive reasoning — syllogisms, constraints, implications',
+    'code-generation': 'Generating code from specifications — algorithms, data structures',
+    'other': 'General problem-solving',
+  };
+  return descs[category] || 'General problem-solving domain';
+}
+
+// ===========================================================================
+// Layer 11: Confidence-Weighted Voting
+//
+// Weight votes by self-assessed quality (score + iteration count),
+// not just by output match. A solution that scored 0.9 in 1 iteration
+// should count more than one that scored 0.1 in 8 iterations.
+// ===========================================================================
+
+function confidenceWeightedVoting(
+  allResults: IterationResult[],
+  config: ExpertConfig
+): IterationResult[] {
+  const { useNewVoting, countFailedMatches, itersTiebreak, lowToHighIters } = config.voting;
+
+  // Group by canonical output key
+  const candidateBuckets = new Map<string, IterationResult[]>();
+  const failureBuckets = new Map<string, IterationResult[]>();
+
+  for (const res of allResults) {
+    const isPasser = res.trainResults.length > 0 && res.trainResults.every((r) => r.success);
+    const key = canonicalKey(res.testResults);
+
+    if (isPasser) {
+      (candidateBuckets.get(key) || candidateBuckets.set(key, []).get(key)!).push(res);
+    } else {
+      (failureBuckets.get(key) || failureBuckets.set(key, []).get(key)!).push(res);
+    }
+  }
+
+  if (countFailedMatches) {
+    for (const [k, failures] of failureBuckets) {
+      if (candidateBuckets.has(k)) {
+        candidateBuckets.get(k)!.push(...failures);
+        failureBuckets.delete(k);
+      }
+    }
+  }
+
+  // Compute confidence weight for each result
+  const confidenceWeight = (res: IterationResult): number => {
+    // Base: score (higher = more confident)
+    let weight = res.score;
+
+    // Bonus: solved in fewer iterations (more efficient = more confident)
+    if (res.passed) {
+      weight *= Math.max(0.5, 1 - res.iteration * 0.05); // 5% penalty per iteration
+    }
+
+    // Bonus: high soft score even if not perfect
+    const avgSoft = meanSoft(res);
+    if (avgSoft > 0.8) weight *= 1.2;
+
+    return weight;
+  };
+
+  // Sort groups by total confidence (not just count)
+  let passerGroups = [...candidateBuckets.entries()]
+    .map(([key, results]) => ({
+      key,
+      results,
+      totalConfidence: results.reduce((s, r) => s + confidenceWeight(r), 0),
+    }))
+    .sort((a, b) => b.totalConfidence - a.totalConfidence);
+
+  if (itersTiebreak) {
+    passerGroups = passerGroups.map((g) => ({
+      ...g,
+      results: [...g.results].sort((a, b) =>
+        lowToHighIters ? a.iteration - b.iteration : b.iteration - a.iteration
+      ),
+    }));
+  }
+
+  const failureGroups = [...failureBuckets.entries()]
+    .map(([key, results]) => ({
+      key,
+      results,
+      totalConfidence: results.reduce((s, r) => s + confidenceWeight(r), 0),
+    }))
+    .sort((a, b) => b.totalConfidence - a.totalConfidence);
+
+  const ordered: IterationResult[] = [];
+  ordered.push(...passerGroups.map((g) => g.results[0]).filter(Boolean));
+  ordered.push(...failureGroups.map((g) => g.results[0]).filter(Boolean));
+  ordered.push(...passerGroups.flatMap((g) => g.results.slice(1)));
+  ordered.push(...failureGroups.flatMap((g) => g.results.slice(1)));
+
+  return ordered;
+}
+
+// ===========================================================================
+// Layer 12: Progressive Difficulty
+//
+// Order training examples from easiest to hardest. The solver sees
+// simpler patterns first, building up to the complex ones. This is
+// how Poetiq's format_problem() uses shuffle — but with intelligence.
+// ===========================================================================
+
+/** Order training examples by difficulty (easiest first) */
+function orderByDifficulty(
+  trainInputs: unknown[],
+  trainOutputs: unknown[]
+): number[] {
+  const indices = trainInputs.map((_, i) => i);
+
+  // Proxy for difficulty: output complexity
+  const difficulty = (input: unknown, output: unknown): number => {
+    const inArr = Array.isArray(input) ? input : [];
+    const outArr = Array.isArray(output) ? output : [];
+
+    // Measure 1: output size (bigger = potentially harder)
+    const inSize = gridSize(inArr);
+    const outSize = gridSize(outArr);
+    const sizeScore = Math.max(inSize, outSize);
+
+    // Measure 2: unique values in output (more unique = potentially harder)
+    const uniqueVals = new Set(flatten(outArr)).size;
+
+    // Measure 3: asymmetry between input and output
+    const asymmetry = Math.abs(inSize - outSize);
+
+    return sizeScore + uniqueVals * 2 + asymmetry * 3;
+  };
+
+  const scored = indices.map((i) => ({
+    index: i,
+    diff: difficulty(trainInputs[i], trainOutputs[i]),
+  }));
+
+  scored.sort((a, b) => a.diff - b.diff);
+
+  return scored.map((s) => s.index);
+}
+
+function gridSize(arr: unknown[]): number {
+  const flat = flatten(arr);
+  return flat.length;
+}
+
+function flatten(arr: unknown[]): number[] {
+  const result: number[] = [];
+  const stack: unknown[] = [arr];
+  while (stack.length > 0) {
+    const item = stack.pop()!;
+    if (Array.isArray(item)) {
+      for (let i = item.length - 1; i >= 0; i--) stack.push(item[i]);
+    } else if (typeof item === 'number') {
+      result.push(item);
+    }
+  }
+  return result;
+}
+
+/** Format problem with progressive difficulty order */
+function formatProblemProgressive(
+  trainIn: number[][][],
+  trainOut: number[][][],
+  testIn: number[][][],
+  seed: number = 0
+): string {
+  const orderedIndices = orderByDifficulty(trainIn, trainOut);
+
+  // Reorder from easiest to hardest
+  const orderedIn = orderedIndices.map((i) => trainIn[i]);
+  const orderedOut = orderedIndices.map((i) => trainOut[i]);
+
+  let exampleStr = '';
+  let challengeStr = '';
+
+  for (let e = 0; e < orderedIn.length; e++) {
+    exampleStr += `
+Example #${e + 1}
+Input:
+<Diagram>
+${gridToDiagram(orderedIn[e])}
+</Diagram>
+
+Output:
+<Diagram>
+${gridToDiagram(orderedOut[e])}
+</Diagram>
+`;
+  }
+
+  for (let c = 0; c < testIn.length; c++) {
+    challengeStr += `
+Challenge #${c + 1}
+Input:
+<Diagram>
+${gridToDiagram(testIn[c])}
+</Diagram>
+`;
+  }
+
+  return exampleStr + challengeStr;
+}
+
+// ===========================================================================
+// Layer 13: Auto-Transfer — automatically transfer strategies to new categories
+//
+// When a new category is encountered and no strategies exist for it,
+// automatically transfer the best strategy from an analogous category.
+// ===========================================================================
+
+async function autoTransfer(
+  category: string,
+  modelId: string
+): Promise<{ transferred: boolean; fromCategory: string; strategyId?: string }> {
+  loadStrategyLibrary();
+
+  // Check if we already have strategies for this category
+  const existing = strategyLibrary.filter((s) => s.category === category && s.useCount >= 1);
+  if (existing.length > 0) {
+    return { transferred: false, fromCategory: '' };
+  }
+
+  // Find the best strategy from analogous categories
+  const analogies = findAnalogousCategories(category);
+  let bestSource: StrategyEntry | null = null;
+  let bestSourceCategory = '';
+  let bestROI = -1;
+
+  for (const analog of analogies) {
+    const candidates = strategyLibrary
+      .filter((s) => s.category === analog && s.useCount >= 1 && s.avgScore > 0.3)
+      .sort((a, b) => {
+        const roiA = (a.successCount / Math.max(a.useCount, 1)) * a.avgScore;
+        const roiB = (b.successCount / Math.max(b.useCount, 1)) * b.avgScore;
+        return roiB - roiA;
+      });
+
+    if (candidates.length > 0) {
+      const roi = (candidates[0].successCount / Math.max(candidates[0].useCount, 1)) * candidates[0].avgScore;
+      if (roi > bestROI) {
+        bestROI = roi;
+        bestSource = candidates[0];
+        bestSourceCategory = analog;
+      }
+    }
+  }
+
+  if (!bestSource) {
+    return { transferred: false, fromCategory: '' };
+  }
+
+  // Transfer the strategy
+  const transferred = await transferStrategy(bestSource, category, modelId);
+  if (!transferred) {
+    return { transferred: false, fromCategory: bestSourceCategory };
+  }
+
+  strategyLibrary.push(transferred);
+  saveStrategyLibrary();
+  serverLog(`auto-transfer: ${bestSourceCategory} → ${category}, strategy ${transferred.id}`);
+
+  // Also create a harness spec for this category
+  loadHarnessSpecs();
+  const spec: HarnessSpec = {
+    id: randomBytes(4).toString('hex'),
+    category,
+    approach: category.includes('knowledge') || category.includes('logical')
+      ? 'chain-of-questions'
+      : 'code-sandbox',
+    solverPrompt: transferred.solverPrompt,
+    feedbackPrompt: transferred.feedbackPrompt,
+    configOverrides: transferred.configOverrides,
+    validationScore: 0,
+    validationTests: 0,
+    validated: false,
+    parentId: null,
+    generation: 0,
+    created: Date.now(),
+    useCount: 0,
+    successCount: 0,
+    avgScore: 0,
+  };
+  harnessSpecs.push(spec);
+  saveHarnessSpecs();
+
+  return { transferred: true, fromCategory: bestSourceCategory, strategyId: transferred.id };
+}
+
+// ===========================================================================
 // Strategy templates — the base prompts the meta-system modifies
-// =============================================================================
+// ============================================================================
 
 const CODE_REASONING_SOLVER = `You are a world-class expert in solving problems by writing executable JavaScript code. Your approach is methodical, creative, and highly effective. You produce elegant, efficient, and well-documented solutions.
 
@@ -2630,11 +3867,13 @@ async function dispatchAction(
       const solveStart = Date.now();
 
       // =================================================================
-      // META-SYSTEM V2: critique-don't-create + meta-rules + bandit
+      // META-SYSTEM V3: 13 layers of proprietary parity
       // =================================================================
       let metaFeatures: ProblemFeatures | null = null;
       let usedStrategyId: string | null = null;
       let usedCustomPrompts = false;
+      let usedHarnessSpecs: HarnessSpec[] = [];
+      let autoTransferResult: { transferred: boolean; fromCategory: string; strategyId?: string } | null = null;
 
       if (useMeta && session.taskConfig.models.length > 0) {
         // Build the problem text for the critic
@@ -2648,10 +3887,6 @@ async function dispatchAction(
           }
         }
 
-        // Layer 1: Check strategy library for a proven strategy
-        const categoryGuess = session.taskConfig.type === 'code-reasoning' ? 'grid-transformation' : session.taskConfig.type;
-        const bestStrategy = findBestStrategy(categoryGuess, session.taskConfig.models);
-
         // Layer 0: Critique the base template and propose deltas
         const basePrompt = session.taskConfig.type === 'code-reasoning'
           ? CODE_REASONING_SOLVER
@@ -2662,15 +3897,30 @@ async function dispatchAction(
         metaFeatures = await critiqueAndAdapt(analyzeText, basePrompt, session.taskConfig.models[0]);
         serverLog(`meta-critic: category=${metaFeatures.category} difficulty=${metaFeatures.difficulty} delta=${JSON.stringify({pre: !!metaFeatures.promptDelta.preProblemInsert, post: !!metaFeatures.promptDelta.postProblemInsert, anti: metaFeatures.promptDelta.antiPatterns.length})}`);
 
+        // Layer 10: Auto-transfer strategies from analogous categories
+        autoTransferResult = await autoTransfer(metaFeatures.category, session.taskConfig.models[0]);
+        if (autoTransferResult.transferred) {
+          serverLog(`auto-transfer: ${autoTransferResult.fromCategory} → ${metaFeatures.category}, strategy ${autoTransferResult.strategyId}`);
+        }
+
+        // Layer 1: Check strategy library for a proven strategy
+        const bestStrategy = findBestStrategy(metaFeatures.category, session.taskConfig.models);
+
         // Layer 1: If library has a proven strategy with high ROI, prefer it
         if (bestStrategy && bestStrategy.avgScore > 0.5 && (bestStrategy.useCount >= 2 || bestStrategy.qualityMetrics.observationCount >= 1)) {
           usedStrategyId = bestStrategy.id;
           usedCustomPrompts = true;
           serverLog(`meta: using library strategy ${bestStrategy.id} (avgScore=${bestStrategy.avgScore.toFixed(2)}, uses=${bestStrategy.useCount})`);
         } else {
-          // Use delta-modified prompt (critique-don't-create)
           usedCustomPrompts = true;
           serverLog(`meta: applying delta to base template`);
+        }
+
+        // Layer 6: Check for validated harness specs
+        loadHarnessSpecs();
+        usedHarnessSpecs = selectSpecsByApproach(metaFeatures.category, session.taskConfig.numExperts);
+        if (usedHarnessSpecs.length > 0) {
+          serverLog(`meta: using ${usedHarnessSpecs.length} harness spec(s) for approaches: ${usedHarnessSpecs.map(s => s.approach).join(', ')}`);
         }
 
         // Layer 3: Thompson sampling for model routing
@@ -2682,10 +3932,24 @@ async function dispatchAction(
         }
       }
 
-      // Generate expert configs
-      let expertConfigs = generateExpertConfigs(session.taskConfig, session.strategyAdaptations);
+      // =================================================================
+      // Expert config generation — with ensemble diversification (Layer 7)
+      // =================================================================
+      let expertConfigs: ExpertConfig[];
 
-      if (usedCustomPrompts && metaFeatures) {
+      if (useMeta && metaFeatures && session.taskConfig.numExperts > 1 && usedHarnessSpecs.length > 0) {
+        // Layer 7: Diverse approaches — each expert gets a different spec
+        expertConfigs = generateDiverseExpertConfigs(
+          session.taskConfig, metaFeatures, session.strategyAdaptations, usedHarnessSpecs
+        );
+      } else if (useMeta && metaFeatures && session.taskConfig.numExperts > 1) {
+        // Generate diverse configs without harness specs (use approach templates)
+        expertConfigs = generateDiverseExpertConfigs(
+          session.taskConfig, metaFeatures, session.strategyAdaptations, []
+        );
+      } else if (usedCustomPrompts && metaFeatures) {
+        // Single expert with meta — apply deltas
+        expertConfigs = generateExpertConfigs(session.taskConfig, session.strategyAdaptations);
         const bestStrategy = usedStrategyId
           ? loadStrategyLibrary().find((s) => s.id === usedStrategyId)
           : null;
@@ -2694,7 +3958,6 @@ async function dispatchAction(
           const customCfg = { ...cfg };
 
           if (bestStrategy) {
-            // Use proven strategy from library
             customCfg.solverPrompt = bestStrategy.solverPrompt;
             customCfg.feedbackPrompt = bestStrategy.feedbackPrompt;
             if (bestStrategy.configOverrides.temperature !== undefined)
@@ -2704,134 +3967,143 @@ async function dispatchAction(
             if (bestStrategy.configOverrides.reasoning !== undefined)
               customCfg.reasoning = bestStrategy.configOverrides.reasoning!;
           } else {
-            // Apply delta to base template (critique-don't-create)
-            const basePrompt = cfg.solverPrompt;
-
-            // First apply meta-rules (Layer 2)
             const metaRuleDelta = applyMetaRules(metaFeatures.category, metaFeatures.difficulty);
-
-            // Then apply the critic's delta (Layer 0)
             const combinedDelta: PromptDelta = {
-              preProblemInsert: [
-                metaRuleDelta.preProblemInsert,
-                metaFeatures.promptDelta.preProblemInsert
-              ].filter(Boolean).join('\n') || null,
-              postProblemInsert: [
-                metaRuleDelta.postProblemInsert,
-                metaFeatures.promptDelta.postProblemInsert
-              ].filter(Boolean).join('\n') || null,
-              sectionReplacements: {
-                ...metaRuleDelta.sectionReplacements,
-                ...metaFeatures.promptDelta.sectionReplacements,
-              },
-              additionalExamples: [
-                ...metaRuleDelta.additionalExamples,
-                ...metaFeatures.promptDelta.additionalExamples,
-              ],
-              antiPatterns: [
-                ...metaRuleDelta.antiPatterns,
-                ...metaFeatures.promptDelta.antiPatterns,
-              ],
+              preProblemInsert: [metaRuleDelta.preProblemInsert, metaFeatures.promptDelta.preProblemInsert].filter(Boolean).join('\n') || null,
+              postProblemInsert: [metaRuleDelta.postProblemInsert, metaFeatures.promptDelta.postProblemInsert].filter(Boolean).join('\n') || null,
+              sectionReplacements: { ...metaRuleDelta.sectionReplacements, ...metaFeatures.promptDelta.sectionReplacements },
+              additionalExamples: [...metaRuleDelta.additionalExamples, ...metaFeatures.promptDelta.additionalExamples],
+              antiPatterns: [...metaRuleDelta.antiPatterns, ...metaFeatures.promptDelta.antiPatterns],
             };
-
-            customCfg.solverPrompt = applyPromptDelta(basePrompt, combinedDelta);
-
-            // Apply analyzer suggestions for config
-            if (metaFeatures.suggestedMaxIterations) {
-              customCfg.maxIterations = metaFeatures.suggestedMaxIterations;
-            }
-            if (metaFeatures.suggestedTemperature) {
-              customCfg.temperature = metaFeatures.suggestedTemperature;
-            }
-            if (metaFeatures.suggestedReasoning) {
-              customCfg.reasoning = metaFeatures.suggestedReasoning;
-            }
+            customCfg.solverPrompt = applyPromptDelta(cfg.solverPrompt, combinedDelta);
+            if (metaFeatures.suggestedMaxIterations) customCfg.maxIterations = metaFeatures.suggestedMaxIterations;
+            if (metaFeatures.suggestedTemperature) customCfg.temperature = metaFeatures.suggestedTemperature;
+            if (metaFeatures.suggestedReasoning) customCfg.reasoning = metaFeatures.suggestedReasoning;
           }
 
           // Layer 3: Thompson model routing
-          if (metaFeatures && session.taskConfig!.models.length > 1) {
+          if (session.taskConfig!.models.length > 1) {
             const routed = thompsonSampleModel(metaFeatures.category, session.taskConfig!.models);
             const resolved = resolveModel(routed);
             if (resolved) {
               const key = getApiKey(resolved.provider);
               if (key) customCfg.llmId = routed;
             }
-          } else if (metaFeatures?.preferredModel && i === 0) {
-            const resolved = resolveModel(metaFeatures.preferredModel);
-            if (resolved) {
-              const key = getApiKey(resolved.provider);
-              if (key) customCfg.llmId = metaFeatures.preferredModel;
-            }
           }
 
           return customCfg;
         });
+      } else {
+        expertConfigs = generateExpertConfigs(session.taskConfig, session.strategyAdaptations);
       }
 
       // =================================================================
-      // SOLVE with budget bandit (Layer 4: early stopping)
+      // Layer 12: Progressive difficulty — order training examples
+      // =================================================================
+      const orderedTrainInputs = [...trainInputs];
+      const orderedTrainOutputs = [...trainOutputs];
+      if (trainInputs.length > 2 && useMeta) {
+        const orderIndices = orderByDifficulty(trainInputs, trainOutputs);
+        for (let i = 0; i < orderIndices.length; i++) {
+          orderedTrainInputs[i] = trainInputs[orderIndices[i]];
+          orderedTrainOutputs[i] = trainOutputs[orderIndices[i]];
+        }
+      }
+
+      // =================================================================
+      // SOLVE with budget bandit (Layer 4+9: early stopping + marginal ROI)
       // =================================================================
       const allResults: IterationResult[] = [];
-      const budget = {
-        maxCost,
-        maxTime,
-        startTime: solveStart,
-        costSoFar: session.totalCost,
-      };
+      const budget = { maxCost, maxTime, startTime: solveStart, costSoFar: session.totalCost };
 
-      // Track per-expert iteration history for early stopping
+      // Track per-expert iteration history for early stopping + ROI
       const expertHistories: Map<number, Array<{ score: number; passed: boolean }>> = new Map();
+      const expertCostHistories: Map<number, Array<{ score: number; iteration: number; cost: number }>> = new Map();
       for (let i = 0; i < expertConfigs.length; i++) {
         expertHistories.set(i, []);
+        expertCostHistories.set(i, []);
       }
 
-      // Run experts — with early stopping per expert
+      // Run experts — with early stopping + budget reallocation
       const expertResults: IterationResult[][] = [];
 
       if (expertConfigs.length === 1) {
-        // Single expert: run directly
         const results = await solveWithExpert(
           session, expertConfigs[0], 0,
-          problem, trainInputs, trainOutputs, testInputs,
+          problem, orderedTrainInputs, orderedTrainOutputs, testInputs,
           session.taskConfig!.verification, session.taskConfig!.verifyCommand, budget
         );
         expertResults.push(results);
       } else {
-        // Multiple experts: run in parallel with early stopping via custom wrapper
-        const expertPromises = expertConfigs.map(async (cfg, i) => {
-          // Run with reduced max iterations first, check progress, then continue
-          const halfConfig = { ...cfg, maxIterations: Math.min(3, cfg.maxIterations) };
-          const firstHalf = await solveWithExpert(
-            session, halfConfig, i,
-            problem, trainInputs, trainOutputs, testInputs,
+        // Multi-expert: phased execution with budget reallocation (Layer 9)
+        // Phase 1: Run all experts for half-iterations
+        const halfIters = Math.ceil(Math.max(...expertConfigs.map(c => c.maxIterations)) / 2);
+        const halfConfigs = expertConfigs.map(cfg => ({ ...cfg, maxIterations: Math.min(halfIters, cfg.maxIterations) }));
+
+        const phase1Promises = halfConfigs.map((cfg, i) =>
+          solveWithExpert(
+            session, cfg, i,
+            problem, orderedTrainInputs, orderedTrainOutputs, testInputs,
             session.taskConfig!.verification, session.taskConfig!.verifyCommand, budget
-          );
+          )
+        );
+        const phase1Results = await Promise.all(phase1Promises);
 
-          // Check if we should continue or stop early
-          const history = firstHalf.map((r) => ({ score: r.score, passed: r.passed }));
+        // Check early stopping per expert
+        const continueExperts: number[] = [];
+        for (let i = 0; i < phase1Results.length; i++) {
+          const history = phase1Results[i].map(r => ({ score: r.score, passed: r.passed }));
           const stopCheck = shouldStopEarly(history);
-
-          if (stopCheck.stop) {
+          if (!stopCheck.stop) {
+            continueExperts.push(i);
+          } else {
             serverLog(`budget-bandit: stopping expert ${i} early — ${stopCheck.reason}`);
-            return firstHalf;
+          }
+        }
+
+        // Phase 2: Continue only promising experts, with budget reallocation
+        if (continueExperts.length > 0) {
+          // Layer 9: Reallocate budget based on marginal ROI
+          for (const i of continueExperts) {
+            const results = phase1Results[i];
+            const costHistory = results.map(r => ({
+              score: r.score,
+              iteration: r.iteration,
+              cost: session.totalCost / results.length,
+            }));
+            expertCostHistories.set(i, costHistory);
           }
 
-          // Continue with remaining iterations
-          const remainingIters = cfg.maxIterations - firstHalf.length;
-          if (remainingIters <= 0) return firstHalf;
+          const totalRemaining = expertConfigs.reduce((s, c) => s + c.maxIterations, 0)
+            - phase1Results.reduce((s, r) => s + r.length, 0);
+          const reallocation = reallocateBudget(expertCostHistories, totalRemaining, maxCost ?? Infinity);
 
-          const secondConfig = { ...cfg, maxIterations: remainingIters };
-          const secondHalf = await solveWithExpert(
-            session, secondConfig, i,
-            problem, trainInputs, trainOutputs, testInputs,
-            session.taskConfig!.verification, session.taskConfig!.verifyCommand, budget
-          );
+          const phase2Promises = continueExperts.map(async (expertIdx) => {
+            const remainingIters = reallocation.get(expertIdx) ??
+              (expertConfigs[expertIdx].maxIterations - phase1Results[expertIdx].length);
+            if (remainingIters <= 0) return [];
+            const cfg = { ...expertConfigs[expertIdx], maxIterations: remainingIters };
+            return solveWithExpert(
+              session, cfg, expertIdx,
+              problem, orderedTrainInputs, orderedTrainOutputs, testInputs,
+              session.taskConfig!.verification, session.taskConfig!.verifyCommand, budget
+            );
+          });
 
-          return [...firstHalf, ...secondHalf];
-        });
+          const phase2Results = await Promise.all(phase2Promises);
+          for (let i = 0; i < continueExperts.length; i++) {
+            if (phase2Results[i]) {
+              expertResults.push([...phase1Results[continueExperts[i]], ...phase2Results[i]]);
+            }
+          }
+        }
 
-        const results = await Promise.all(expertPromises);
-        for (const r of results) expertResults.push(r);
+        // Add stopped experts' results too
+        for (let i = 0; i < phase1Results.length; i++) {
+          if (!continueExperts.includes(i)) {
+            expertResults.push(phase1Results[i]);
+          }
+        }
       }
 
       for (const results of expertResults) {
@@ -2853,8 +4125,9 @@ async function dispatchAction(
 
       session.iterations = allResults;
 
+      // Layer 11: Confidence-weighted voting
       const ranked = expertConfigs.length > 0
-        ? rankByVoting(allResults, expertConfigs[0])
+        ? confidenceWeightedVoting(allResults, expertConfigs[0])
         : allResults;
 
       session.bestResult = ranked[0] || null;
@@ -2874,22 +4147,12 @@ async function dispatchAction(
         const firstIter = allResults.find((r) => r.iteration === 0);
         const codeParsed = allResults.some((r) => r.code && r.code.length > 0);
         const sandboxOk = allResults.some((r) => r.trainResults.some((tr) => tr.softScore > 0));
-        recordPromptQuality(
-          usedStrategyId,
-          codeParsed,
-          sandboxOk,
-          firstIter?.score ?? 0
-        );
+        recordPromptQuality(usedStrategyId, codeParsed, sandboxOk, firstIter?.score ?? 0);
       }
 
       // Record strategy result in library
       if (usedStrategyId) {
-        recordStrategyUse(
-          usedStrategyId, passed, bestScore, cost, totalDuration,
-          session.taskConfig.models[0]
-        );
-
-        // Layer 3: Record model routing stats
+        recordStrategyUse(usedStrategyId, passed, bestScore, cost, totalDuration, session.taskConfig.models[0]);
         recordModelRoute(
           expertConfigs[0]?.llmId || session.taskConfig.models[0],
           metaFeatures?.category || 'other',
@@ -2937,11 +4200,46 @@ async function dispatchAction(
           serverLog(`meta: saved new strategy ${newEntry.id} (category=${newEntry.category}, score=${bestScore.toFixed(2)})`);
         }
 
-        // Record model routing even without strategy ID
+        // Layer 6: Save harness spec for this category
+        loadHarnessSpecs();
+        const existingSpecForCategory = harnessSpecs.find(
+          (s) => s.category === metaFeatures.category && s.approach === 'code-sandbox' && s.useCount >= 1
+        );
+        if (!existingSpecForCategory && (passed || bestScore > 0.3)) {
+          const newSpec: HarnessSpec = {
+            id: randomBytes(4).toString('hex'),
+            category: metaFeatures.category,
+            approach: 'code-sandbox',
+            solverPrompt: expertConfigs[0]?.solverPrompt || CODE_REASONING_SOLVER,
+            feedbackPrompt: expertConfigs[0]?.feedbackPrompt || CODE_REASONING_FEEDBACK,
+            configOverrides: {
+              temperature: expertConfigs[0]?.temperature,
+              maxIterations: expertConfigs[0]?.maxIterations,
+              reasoning: expertConfigs[0]?.reasoning,
+            },
+            validationScore: bestScore,
+            validationTests: 1,
+            validated: true,
+            parentId: null,
+            generation: 0,
+            created: Date.now(),
+            useCount: 1,
+            successCount: passed ? 1 : 0,
+            avgScore: bestScore,
+          };
+          harnessSpecs.push(newSpec);
+          saveHarnessSpecs();
+          serverLog(`meta: saved harness spec ${newSpec.id} (category=${metaFeatures.category}, approach=code-sandbox)`);
+        } else if (existingSpecForCategory) {
+          existingSpecForCategory.useCount++;
+          if (passed) existingSpecForCategory.successCount++;
+          existingSpecForCategory.avgScore = (existingSpecForCategory.avgScore * (existingSpecForCategory.useCount - 1) + bestScore) / existingSpecForCategory.useCount;
+          saveHarnessSpecs();
+        }
+
         recordModelRoute(
           expertConfigs[0]?.llmId || session.taskConfig.models[0],
-          metaFeatures.category,
-          passed, bestScore, cost, totalDuration
+          metaFeatures.category, passed, bestScore, cost, totalDuration
         );
       }
 
@@ -2954,6 +4252,7 @@ async function dispatchAction(
         serverLog(`auto-meta: triggered improvement — ${autoResult.reason} → child ${autoResult.childId}`);
       }
 
+      // Build output text
       let text = passed
         ? `✅ SOLVED in ${totalIters} iterations (${totalDuration.toFixed(1)}s, ${totalTokens} tokens, $${cost.toFixed(4)})`
         : `❌ Not fully solved after ${totalIters} iterations (best score: ${bestScore.toFixed(2)}, ${totalDuration.toFixed(1)}s, $${cost.toFixed(4)})`;
@@ -2966,13 +4265,19 @@ async function dispatchAction(
         text += `\n🧠 Meta: category=${metaFeatures.category} difficulty=${metaFeatures.difficulty.toFixed(1)}${usedStrategyId ? ` strategy=${usedStrategyId}` : ' (delta-modified)'} delta={pre:${!!delta.preProblemInsert} post:${!!delta.postProblemInsert} anti:${delta.antiPatterns.length}}`;
       }
 
+      if (usedHarnessSpecs.length > 0) {
+        text += `\n🏗️ Harness specs: ${usedHarnessSpecs.map(s => s.approach).join(', ')}`;
+      }
+
+      if (autoTransferResult?.transferred) {
+        text += `\n🔀 Auto-transfer: ${autoTransferResult.fromCategory} → ${metaFeatures?.category}`;
+      }
+
       if (autoResult.improved) {
         text += `\n🔄 Auto-improved: ${autoResult.reason} → ${autoResult.childId}`;
       }
 
-      if (reExploreNote) {
-        text += reExploreNote;
-      }
+      if (reExploreNote) text += reExploreNote;
 
       if (session.strategyAdaptations.length > 0) {
         text += `\n🧠 ${session.strategyAdaptations.length} strategy adaptation(s) active`;
@@ -2995,20 +4300,11 @@ async function dispatchAction(
       return {
         text,
         details: {
-          passed,
-          bestScore,
-          totalIterations: totalIters,
-          totalTokens,
-          cost,
-          totalDuration,
-          rankedResults: ranked.map((r) => ({
-            expert: r.expertIndex,
-            iteration: r.iteration,
-            passed: r.passed,
-            score: r.score,
-          })),
-          autoImproved: autoResult.improved,
-          autoImproveReason: autoResult.reason,
+          passed, bestScore, totalIterations: totalIters, totalTokens, cost, totalDuration,
+          rankedResults: ranked.map(r => ({ expert: r.expertIndex, iteration: r.iteration, passed: r.passed, score: r.score })),
+          autoImproved: autoResult.improved, autoImproveReason: autoResult.reason,
+          harnessSpecsUsed: usedHarnessSpecs.length,
+          autoTransferred: autoTransferResult?.transferred ?? false,
         },
       };
     }
@@ -3296,6 +4592,138 @@ async function dispatchAction(
         text: `🚦 Model Routes (${modelRouteStats.length} entries):\n${lines.join('\n')}`,
         details: { routes: modelRouteStats },
       };
+    }
+
+    case 'harness-specs': {
+      loadHarnessSpecs();
+
+      if (harnessSpecs.length === 0) {
+        return { text: '🏗️ No harness specs yet. Solve problems with meta=true to build them.', details: { specs: [] } };
+      }
+
+      const lines = harnessSpecs
+        .sort((a, b) => b.avgScore - a.avgScore || b.validationScore - a.validationScore)
+        .map((s, i) => {
+          const successRate = s.useCount > 0 ? (s.successCount / s.useCount * 100).toFixed(0) : '0';
+          const valStr = s.validated
+            ? `val=${s.validationScore.toFixed(2)} (${s.validationTests} tests)`
+            : 'unvalidated';
+          return `${i + 1}. [${s.id}] ${s.approach} cat=${s.category} gen=${s.generation} prod=${s.avgScore.toFixed(2)} win=${successRate}% uses=${s.useCount} ${valStr}${s.parentId ? ` parent=${s.parentId}` : ''}`;
+        });
+
+      return {
+        text: `🏗️ Harness Specs (${harnessSpecs.length} specs):\n${lines.join('\n')}`,
+        details: { specs: harnessSpecs },
+      };
+    }
+
+    case 'evolve-harness': {
+      if (!session.taskConfig) {
+        return { text: '❌ No session initialized. Call init first.', details: {} };
+      }
+
+      loadHarnessSpecs();
+      if (harnessSpecs.length === 0) {
+        return { text: '🏗️ No harness specs to evolve. Solve problems with meta=true first.', details: {} };
+      }
+
+      // Pick the worst-performing spec to evolve
+      const candidates = harnessSpecs
+        .filter((s) => s.useCount >= 1)
+        .sort((a, b) => a.avgScore - b.avgScore);
+
+      if (candidates.length === 0) {
+        return { text: '🏗️ No specs with production data to evolve.', details: {} };
+      }
+
+      const target = candidates[0];
+      const child = await evolveHarnessSpec(target, session.taskConfig.models[0]);
+
+      if (!child) {
+        return { text: `❌ Failed to evolve spec ${target.id}. LLM didn't return valid JSON.`, details: { targetId: target.id } };
+      }
+
+      harnessSpecs.push(child);
+      saveHarnessSpecs();
+
+      let text = `🏗️ Harness Spec Evolution:\n`;
+      text += `Parent: ${target.id} (gen=${target.generation}, approach=${target.approach}, score=${target.avgScore.toFixed(2)})\n`;
+      text += `Child:  ${child.id} (gen=${child.generation}, approach=${child.approach})\n`;
+      text += `\nNew solver prompt (${child.solverPrompt.length} chars):\n${child.solverPrompt.slice(0, 300)}...\n`;
+      text += `\nConfig overrides: ${JSON.stringify(child.configOverrides)}`;
+
+      return { text, details: { parentId: target.id, childId: child.id, generation: child.generation } };
+    }
+
+    case 'transfer': {
+      if (!session.taskConfig) {
+        return { text: '❌ No session initialized. Call init first.', details: {} };
+      }
+
+      const sourceCategory = params.sourceCategory as string;
+      const targetCategory = params.targetCategory as string;
+
+      if (!sourceCategory || !targetCategory) {
+        return { text: '❌ transfer requires --source-category and --target-category.', details: {} };
+      }
+
+      loadStrategyLibrary();
+      const sourceStrategies = strategyLibrary
+        .filter((s) => s.category === sourceCategory && s.useCount >= 1 && s.avgScore > 0.3)
+        .sort((a, b) => {
+          const roiA = (a.successCount / Math.max(a.useCount, 1)) * a.avgScore;
+          const roiB = (b.successCount / Math.max(b.useCount, 1)) * b.avgScore;
+          return roiB - roiA;
+        });
+
+      if (sourceStrategies.length === 0) {
+        return { text: `📚 No proven strategies for category "${sourceCategory}" to transfer.`, details: {} };
+      }
+
+      const source = sourceStrategies[0];
+      const transferred = await transferStrategy(source, targetCategory, session.taskConfig.models[0]);
+
+      if (!transferred) {
+        return { text: `❌ Failed to transfer strategy from ${sourceCategory} to ${targetCategory}.`, details: {} };
+      }
+
+      strategyLibrary.push(transferred);
+      saveStrategyLibrary();
+
+      let text = `🔀 Strategy Transfer:\n`;
+      text += `Source: ${source.id} (${sourceCategory}, score=${source.avgScore.toFixed(2)})\n`;
+      text += `Target: ${transferred.id} (${targetCategory})\n`;
+      text += `\nTransferred prompt (${transferred.solverPrompt.length} chars):\n${transferred.solverPrompt.slice(0, 300)}...`;
+
+      return { text, details: { sourceId: source.id, targetId: transferred.id, sourceCategory, targetCategory } };
+    }
+
+    case 'decompose': {
+      if (!session.taskConfig) {
+        return { text: '❌ No session initialized. Call init first.', details: {} };
+      }
+
+      const problemText = params.problem as string;
+      if (!problemText) {
+        return { text: '❌ decompose requires --problem.', details: {} };
+      }
+
+      const decomposition = await decomposeProblem(problemText, session.taskConfig.models[0]);
+
+      if (!decomposition) {
+        return { text: `❌ Failed to decompose problem. LLM didn't return valid JSON.`, details: {} };
+      }
+
+      let text = `🔬 Problem Decomposition:\n`;
+      text += `Strategy: ${decomposition.combineStrategy}\n`;
+      text += `Sub-problems (${decomposition.subProblems.length}):\n`;
+      for (const sub of decomposition.subProblems) {
+        text += `  #${sub.id}: ${sub.description}\n`;
+        text += `    Input: ${sub.input.slice(0, 100)}\n`;
+      }
+      text += `\nCombine: ${decomposition.combinePrompt.slice(0, 200)}`;
+
+      return { text, details: { decomposition } };
     }
 
     default:

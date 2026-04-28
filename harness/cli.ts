@@ -410,6 +410,37 @@ Environment:
       break;
     }
 
+    case 'harness-specs': {
+      await postAction(JSON.stringify({ action: 'harness-specs' }));
+      break;
+    }
+
+    case 'evolve-harness': {
+      await postAction(JSON.stringify({ action: 'evolve-harness' }));
+      break;
+    }
+
+    case 'transfer': {
+      const sourceCategory = extractFlag(args, 'source-category');
+      const targetCategory = extractFlag(args, 'target-category');
+      if (!sourceCategory || !targetCategory) {
+        process.stderr.write('transfer requires --source-category and --target-category\n');
+        process.exit(1);
+      }
+      await postAction(JSON.stringify({ action: 'transfer', sourceCategory, targetCategory }));
+      break;
+    }
+
+    case 'decompose': {
+      const problem = extractFlag(args, 'problem');
+      if (!problem) {
+        process.stderr.write('decompose requires --problem\n');
+        process.exit(1);
+      }
+      await postAction(JSON.stringify({ action: 'decompose', problem }));
+      break;
+    }
+
     case 'clear': {
       await postAction(JSON.stringify({ action: 'clear' }));
       break;
