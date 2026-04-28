@@ -26,7 +26,7 @@ export function registerTools(pi: ExtensionAPI): void {
         Type.Literal('none'),
       ], { description: 'Verification method', default: 'sandbox' }),
     }),
-    execute: async (_toolCallId, params) => {
+    execute: async (_toolCallId, params, _signal?, _onUpdate?) => {
       const { execFile } = await import('node:child_process');
       const payload = JSON.stringify({ action: 'init', ...params });
       return new Promise((resolve) => {
@@ -51,7 +51,7 @@ export function registerTools(pi: ExtensionAPI): void {
       trainOutputs: Type.Array(Type.Any(), { description: 'Training output data (ground truth) for verification' }),
       testInputs: Type.Array(Type.Any(), { description: 'Test input data' }),
     }),
-    execute: async (_toolCallId, params) => {
+    execute: async (_toolCallId, params, _signal?, _onUpdate?) => {
       const { execFile } = await import('node:child_process');
       const payload = JSON.stringify({ action: 'solve', ...params });
       return new Promise((resolve) => {
@@ -71,7 +71,7 @@ export function registerTools(pi: ExtensionAPI): void {
     label: 'Reason Harness Status',
     description: 'Check the current reasoning harness session status, including iterations, scores, cost, and learned strategy adaptations.',
     parameters: Type.Object({}),
-    execute: async (_toolCallId, _params) => {
+    execute: async (_toolCallId, _params, _signal?, _onUpdate?) => {
       const { execFile } = await import('node:child_process');
       const payload = JSON.stringify({ action: 'status' });
       return new Promise((resolve) => {

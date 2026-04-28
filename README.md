@@ -76,38 +76,38 @@ pi-reason-harness init --name "budget test" --type code-reasoning --max-cost 0.5
 
 ```
 ┌──────────────────────────────────────────────────┐
-│  META-SYSTEM (strategy discovery + learning)      │
-│  - Selects prompt templates by task type          │
-│  - Applies learned strategy adaptations            │
-│  - Tracks model preferences                       │
-│  - Detects feedback effectiveness                 │
+│  META-SYSTEM (strategy discovery + learning)     │
+│  - Selects prompt templates by task type         │
+│  - Applies learned strategy adaptations          │
+│  - Tracks model preferences                      │
+│  - Detects feedback effectiveness                │
 │  - Budget enforcement                            │
 └──────────────┬───────────────────────────────────┘
                │ generates (with adaptations)
                ▼
 ┌──────────────────────────────────────────────────┐
-│  TASK-SPECIFIC HARNESS                            │
-│                                                    │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
-│  │ Expert 1 │  │ Expert 2 │  │ Expert N │       │
-│  │(pi-ai    │  │(pi-ai    │  │(pi-ai    │       │
-│  │ LLM call │  │ LLM call │  │ LLM call │       │
-│  │ + sandbox│  │ + sandbox│  │ + sandbox│       │
-│  │ /audit   │  │ /audit   │  │ /audit   │       │
-│  │ + verify │  │ + verify │  │ + verify │       │
-│  │ + feedback│ │ + feedback│ │ + feedback│       │
-│  │ loop)    │  │ loop)    │  │ loop)    │       │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘       │
+│  TASK-SPECIFIC HARNESS                           │
+│                                                  │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐     │
+│  │ Expert 1  │  │ Expert 2  │  │ Expert N  │     │
+│  │ (pi-ai    │  │ (pi-ai    │  │ (pi-ai    │     │
+│  │ LLM call  │  │ LLM call  │  │ LLM call  │     │
+│  │ + sandbox │  │ + sandbox │  │ + sandbox │     │
+│  │ /audit    │  │ /audit    │  │ /audit    │     │
+│  │ + verify  │  │ + verify  │  │ + verify  │     │
+│  │ + feedback│  │ + feedback│  │ + feedback│     │
+│  │ loop)     │  │ loop)     │  │ loop)     │     │
+│  └────┬───── ┘  └───┬───────┘  └──┬────────┘     │
 │       └─────────────┼─────────────┘              │
 │                     ▼                            │
-│              VOTING / RANKING                     │
-│              (group by output,                    │
-│               most-voted wins,                    │
-│               diversity-first)                    │
+│              VOTING / RANKING                    │
+│              (group by output,                   │
+│               most-voted wins,                   │
+│               diversity-first)                   │
 │                     │                            │
 │                     ▼                            │
-│              LEARN & ADAPT                        │
-│              (update strategy adaptations)        │
+│              LEARN & ADAPT                       │
+│              (update strategy adaptations)       │
 └──────────────────────────────────────────────────┘
                │
                ▼

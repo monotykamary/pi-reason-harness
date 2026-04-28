@@ -11,6 +11,47 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // In production these live in server.ts; for tests we inline the critical ones.
 
 // =============================================================================
+// Grid utilities
+// =============================================================================
+
+function ensure2D(arr: unknown): number[][] | null {
+  if (!Array.isArray(arr)) return null;
+  if (arr.length === 0) return [[]];
+  if (Array.isArray(arr[0])) return arr as number[][];
+  return [arr as unknown[] as number[]];
+}
+
+function gridShape(grid: number[][]): [number, number] {
+  return [grid.length, grid.length > 0 ? grid[0].length : 0];
+}
+
+function arrayDiff(pred: number[][], truth: number[][]): string {
+  const rows = truth.length;
+  const cols = truth.length > 0 ? truth[0].length : 0;
+  const lines: string[] = [];
+  for (let i = 0; i < rows; i++) {
+    const row: string[] = [];
+    const pRow = i < pred.length ? pred[i] : [];
+    const tRow = truth[i];
+    for (let j = 0; j < cols; j++) {
+      const pVal = j < pRow.length ? pRow[j] : '?';
+      const tVal = tRow[j];
+      if (pVal === tVal) {
+        row.push(String(tVal));
+      } else {
+        row.push(`${pVal}/${tVal}`);
+      }
+    }
+    lines.push(row.join(' '));
+  }
+  return lines.join('\n');
+}
+
+function gridToDiagram(grid: number[][]): string {
+  return grid.map(row => row.join(' ')).join('\n');
+}
+
+// =============================================================================
 // Soft score computation
 // =============================================================================
 
@@ -20,21 +61,23 @@ function computeSoftScore(actual: string, expected: unknown): number {
     const expectedArr = Array.isArray(expected) ? expected : JSON.parse(JSON.stringify(expected));
 
     if (!Array.isArray(actualArr) || !Array.isArray(expectedArr)) return 0;
-    if (actualArr.length !== expectedArr.length) return 0;
+
+    const pred2D = ensure2D(actualArr);
+    const truth2D = ensure2D(expectedArr);
+
+    if (!pred2D || !truth2D) return 0;
+
+    const [predRows, predCols] = gridShape(pred2D);
+    const [truthRows, truthCols] = gridShape(truth2D);
+
+    if (predRows !== truthRows || predCols !== truthCols) return 0;
+    if (truthRows === 0 || truthCols === 0) return 1;
 
     let matches = 0;
-    let total = 0;
-    for (let i = 0; i < expectedArr.length; i++) {
-      const aRow = actualArr[i];
-      const eRow = expectedArr[i];
-      if (Array.isArray(aRow) && Array.isArray(eRow)) {
-        for (let j = 0; j < Math.max(aRow.length, eRow.length); j++) {
-          total++;
-          if (j < aRow.length && aRow[j] === eRow[j]) matches++;
-        }
-      } else {
-        total++;
-        if (aRow === eRow) matches++;
+    const total = truthRows * truthCols;
+    for (let i = 0; i < truthRows; i++) {
+      for (let j = 0; j < truthCols; j++) {
+        if (pred2D[i][j] === truth2D[i][j]) matches++;
       }
     }
 
@@ -52,6 +95,22 @@ function compareOutputs(actual: string, expected: unknown): boolean {
   try {
     const actualParsed = JSON.parse(actual);
     const expectedParsed = Array.isArray(expected) ? expected : JSON.parse(JSON.stringify(expected));
+
+    const pred2D = ensure2D(actualParsed);
+    const truth2D = ensure2D(expectedParsed);
+
+    if (pred2D && truth2D) {
+      const [pr, pc] = gridShape(pred2D);
+      const [tr, tc] = gridShape(truth2D);
+      if (pr !== tr || pc !== tc) return false;
+      for (let i = 0; i < tr; i++) {
+        for (let j = 0; j < tc; j++) {
+          if (pred2D[i][j] !== truth2D[i][j]) return false;
+        }
+      }
+      return true;
+    }
+
     return JSON.stringify(actualParsed) === JSON.stringify(expectedParsed);
   } catch {
     return actual.trim() === String(expected).trim();
@@ -82,6 +141,119 @@ function createRNG(seed: number): () => number {
 // =============================================================================
 // Model resolution
 // =============================================================================
+
+function formatProblem(
+  trainIn: number[][][],
+  trainOut: number[][][],
+  testIn: number[][][],
+  shuffle: boolean = true,
+  seed: number = 0
+): string {
+  const indices = trainIn.map((_, i) => i);
+  if (shuffle && indices.length > 1) {
+    const rng = createRNG(seed);
+    for (let i = indices.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+  }
+
+  let exampleStr = '';
+  let challengeStr = '';
+
+  for (let e = 0; e < indices.length; e++) {
+    const idx = indices[e];
+    exampleStr += `\nExample #${e + 1}\nInput:\n<Diagram>\n${gridToDiagram(trainIn[idx])}\n</Diagram>\n\nOutput:\n<Diagram>\n${gridToDiagram(trainOut[idx])}\n</Diagram>\n`;
+  }
+
+  for (let c = 0; c < testIn.length; c++) {
+    challengeStr += `\nChallenge #${c + 1}\nInput:\n<Diagram>\n${gridToDiagram(testIn[c])}\n</Diagram>\n`;
+  }
+
+  return exampleStr + challengeStr;
+}
+
+// =============================================================================
+// Detailed feedback (Poetiq parity)
+// =============================================================================
+
+interface SolveResult {
+  success: boolean;
+  output: string;
+  softScore: number;
+  error: string | null;
+  code: string;
+}
+
+function buildDetailedFeedback(
+  trainResults: SolveResult[],
+  _trainInputs: unknown[],
+  trainOutputs: unknown[]
+): string {
+  const parts: string[] = [];
+
+  for (let i = 0; i < trainResults.length; i++) {
+    const rr = trainResults[i];
+    if (rr.success) {
+      parts.push(`Solves Example #${i + 1} correctly. `);
+      continue;
+    }
+
+    const msgLines: string[] = [`Solves Example #${i + 1} incorrectly. `];
+
+    let predArr: unknown = null;
+    try {
+      if (rr.output) {
+        predArr = JSON.parse(rr.output);
+      }
+    } catch {}
+
+    const truth = trainOutputs[i];
+    const truthArr = Array.isArray(truth) ? truth : null;
+
+    if (!predArr || !Array.isArray(predArr)) {
+      msgLines.push('\nThe output has to be a rectangular grid of numbers.\n');
+      if (rr.error) {
+        msgLines.push(`Your code produced the following error:\n${rr.error.slice(0, 300)}\n`);
+      }
+    } else {
+      const pred2D = ensure2D(predArr);
+      const truth2D = truthArr ? ensure2D(truthArr) : null;
+
+      if (!truth2D || !pred2D) {
+        msgLines.push('\nFailed to parse grids for comparison.\n');
+      } else {
+        const predShape = gridShape(pred2D);
+        const truthShape = gridShape(truth2D);
+
+        if (predShape[0] !== truthShape[0] || predShape[1] !== truthShape[1]) {
+          msgLines.push(
+            `\n\nShape mismatch: your prediction's shape was [${predShape}], ` +
+            `while the correct shape was [${truthShape}].`
+          );
+        } else {
+          msgLines.push(
+            '\nYour code\'s output does not match the expected output.' +
+            '\n\nBelow is a visualization of the 2D array your code produced as well as the expected output.\n' +
+            'Correctly predicted values are shown as-is while the incorrectly predicted values are shown ' +
+            "in the format 'prediction/correct':\n"
+          );
+          const diff = arrayDiff(pred2D, truth2D);
+          msgLines.push(`\n\`\`\`\n${diff}\n\`\`\`\n`);
+          msgLines.push(`Output accuracy: ${rr.softScore.toFixed(2)} (0 is worst, 1 is best).\n`);
+        }
+      }
+
+      if (rr.error) {
+        msgLines.push(`\n\nYour code produced the following error:\n${rr.error.slice(0, 300)}\n`);
+      }
+    }
+
+    parts.push(msgLines.join(''));
+  }
+
+  return parts.join('\n\n');
+}
 
 function resolveModelId(modelId: string): { provider: string; id: string } | null {
   const slashIdx = modelId.indexOf('/');
@@ -673,7 +845,7 @@ if (typeof transform === 'function') {
 }
 `;
 
-      const script = new vm.Script(wrappedCode, { filename: 'sandbox.js', timeout: timeoutS * 1000 });
+      const script = new vm.Script(wrappedCode, { filename: 'sandbox.js' });
       script.runInContext(context, { timeout: timeoutS * 1000 });
 
       const result = context.__output__;
@@ -725,5 +897,108 @@ if (typeof transform === 'function') {
     const result = await runInSandbox(code, [[1]]);
     expect(result.ok).toBe(true);
     expect(JSON.parse(result.output)).toBe('undefined');
+  });
+});
+
+describe('formatProblem', () => {
+  it('formats grids into <Diagram> text', () => {
+    const result = formatProblem(
+      [[[1, 2], [3, 4]]],  // trainIn
+      [[[5, 6], [7, 8]]],  // trainOut
+      [[[9, 10]]],         // testIn
+      false,               // shuffle
+      0                    // seed
+    );
+    expect(result).toContain('<Diagram>');
+    expect(result).toContain('Example #1');
+    expect(result).toContain('Challenge #1');
+    expect(result).toContain('1 2');
+    expect(result).toContain('5 6');
+    expect(result).toContain('9 10');
+  });
+
+  it('shuffles training examples with different seeds', () => {
+    const trainIn = [[[1]], [[2]], [[3]], [[4]], [[5]]];
+    const trainOut = [[[10]], [[20]], [[30]], [[40]], [[50]]];
+
+    const result1 = formatProblem(trainIn, trainOut, [], true, 0);
+    const result2 = formatProblem(trainIn, trainOut, [], true, 42);
+
+    // Same seed should produce same order
+    const result1b = formatProblem(trainIn, trainOut, [], true, 0);
+    expect(result1).toBe(result1b);
+
+    // Different seeds *may* produce different order (probabilistic, but very likely with 5 items)
+    // Just verify they're both valid
+    expect(result1).toContain('<Diagram>');
+    expect(result2).toContain('<Diagram>');
+  });
+
+  it('handles single training example (no shuffle possible)', () => {
+    const result = formatProblem([[[0]]], [[[1]]], [], false, 0);
+    expect(result).toContain('Example #1');
+    expect(result).toContain('0');
+    expect(result).toContain('1');
+  });
+});
+
+describe('arrayDiff', () => {
+  it('shows matching values as-is, mismatches as pred/truth', () => {
+    const pred = [[1, 2], [3, 4]];
+    const truth = [[1, 9], [3, 8]];
+    const diff = arrayDiff(pred, truth);
+    expect(diff).toContain('1');    // match
+    expect(diff).toContain('2/9'); // mismatch
+    expect(diff).toContain('3');    // match
+    expect(diff).toContain('4/8'); // mismatch
+  });
+
+  it('handles fully matching grids', () => {
+    const diff = arrayDiff([[1, 2]], [[1, 2]]);
+    expect(diff).toBe('1 2');
+  });
+});
+
+describe('buildDetailedFeedback (Poetiq parity)', () => {
+  it('reports shape mismatch when dimensions differ', () => {
+    const trainResults: SolveResult[] = [
+      { success: false, output: '[[1,2]]', softScore: 0, error: null, code: '' },
+    ];
+    const trainOutputs = [[[1, 2], [3, 4]]];
+
+    const feedback = buildDetailedFeedback(trainResults, [], trainOutputs);
+    expect(feedback).toContain('Shape mismatch');
+  });
+
+  it('shows diff grid when shapes match but values differ', () => {
+    const trainResults: SolveResult[] = [
+      { success: false, output: '[[1,9],[3,8]]', softScore: 0.5, error: null, code: '' },
+    ];
+    const trainOutputs = [[[1, 2], [3, 4]]];
+
+    const feedback = buildDetailedFeedback(trainResults, [], trainOutputs);
+    expect(feedback).toContain('9/2');
+    expect(feedback).toContain('8/4');
+    expect(feedback).toContain('0.50');
+  });
+
+  it('reports bad JSON output', () => {
+    const trainResults: SolveResult[] = [
+      { success: false, output: 'not json', softScore: 0, error: 'parse error', code: '' },
+    ];
+    const trainOutputs = [[[1]]];
+
+    const feedback = buildDetailedFeedback(trainResults, [], trainOutputs);
+    expect(feedback).toContain('rectangular grid');
+  });
+
+  it('reports execution errors', () => {
+    const trainResults: SolveResult[] = [
+      { success: false, output: '', softScore: 0, error: 'TypeError: Cannot read properties of undefined', code: '' },
+    ];
+    const trainOutputs = [[[1]]];
+
+    const feedback = buildDetailedFeedback(trainResults, [], trainOutputs);
+    expect(feedback).toContain('TypeError');
   });
 });

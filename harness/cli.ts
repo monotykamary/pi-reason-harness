@@ -312,13 +312,13 @@ Environment:
     }
 
     case 'solve': {
-      const problem = extractFlag(args, 'problem');
+      const problem = extractFlag(args, 'problem') ?? '';
       const trainInputsRaw = extractFlag(args, 'train-inputs');
       const trainOutputsRaw = extractFlag(args, 'train-outputs');
       const testInputsRaw = extractFlag(args, 'test-inputs');
 
-      if (!problem) {
-        process.stderr.write('Error: solve requires --problem.\n');
+      if (!problem && !trainInputsRaw) {
+        process.stderr.write('Error: solve requires --problem or --train-inputs/--train-outputs.\n');
         process.exit(1);
       }
 

@@ -52,12 +52,12 @@ function resolveModel(modelId: string): Model<any> | null {
   if (slashIdx === -1) return null;
   const provider = modelId.slice(0, slashIdx);
   const id = modelId.slice(slashIdx + 1);
-  return getModel(provider, id) ?? null;
+  return getModel(provider as any, id) ?? null;
 }
 
 /** Get API key for a provider (checks env vars) */
 function getApiKey(provider: string): string | undefined {
-  return getEnvApiKey(provider);
+  return getEnvApiKey(provider as any);
 }
 
 // =============================================================================
@@ -472,7 +472,6 @@ if (typeof transform === 'function') {
 
     const script = new vm.Script(wrappedCode, {
       filename: 'sandbox.js',
-      timeout: timeoutS * 1000,
     });
 
     script.runInContext(context, {
@@ -784,6 +783,76 @@ ISSUES: [comma-separated list of problems found, or "none"]`;
 }
 
 // =============================================================================
+// Problem formatting — mirrors Poetiq's format_problem()
+// Converts raw grid data into <Diagram> text with optional per-iteration shuffle
+// =============================================================================
+
+/**
+ * Format a problem from raw grid arrays into <Diagram> text.
+ * Mirrors Poetiq's format_problem + _example_to_diagram.
+ *
+ * @param trainIn  Training input grids (3D: [example][row][col])
+ * @param trainOut Training output grids
+ * @param testIn   Test input grids
+ * @param shuffle  Whether to shuffle training example order
+ * @param seed     Seed for the shuffle RNG
+ */
+function formatProblem(
+  trainIn: number[][][],
+  trainOut: number[][][],
+  testIn: number[][][],
+  shuffle: boolean = true,
+  seed: number = 0
+): string {
+  // Build index array for shuffling
+  const indices = trainIn.map((_, i) => i);
+  if (shuffle && indices.length > 1) {
+    const rng = createRNG(seed);
+    // Fisher-Yates shuffle
+    for (let i = indices.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+  }
+
+  let exampleStr = '';
+  let challengeStr = '';
+
+  for (let e = 0; e < indices.length; e++) {
+    const idx = indices[e];
+    exampleStr += `
+Example #${e + 1}
+Input:
+<Diagram>
+${gridToDiagram(trainIn[idx])}
+</Diagram>
+
+Output:
+<Diagram>
+${gridToDiagram(trainOut[idx])}
+</Diagram>
+`;
+  }
+
+  for (let c = 0; c < testIn.length; c++) {
+    challengeStr += `
+Challenge #${c + 1}
+Input:
+<Diagram>
+${gridToDiagram(testIn[c])}
+</Diagram>
+`;
+  }
+
+  return exampleStr + challengeStr;
+}
+
+/** Convert a 2D grid to an ASCII diagram (space-separated values, one row per line) */
+function gridToDiagram(grid: number[][]): string {
+  return grid.map(row => row.join(' ')).join('\n');
+}
+
+// =============================================================================
 // Solve loop — the core iterative refinement engine
 // =============================================================================
 
@@ -808,6 +877,9 @@ async function solveWithExpert(
   let bestIteration: IterationResult | null = null;
   let totalTimeouts = 0;
 
+  // Pre-format problem from raw grid data if available (mirrors Poetiq's format_problem)
+  const hasGridData = trainInputs.length > 0 && trainOutputs.length > 0;
+
   for (let it = 0; it < expertConfig.maxIterations; it++) {
     if (signal?.aborted) break;
 
@@ -815,8 +887,20 @@ async function solveWithExpert(
     if (budget.maxCost && budget.costSoFar >= budget.maxCost) break;
     if (budget.maxTime && (Date.now() - budget.startTime) / 1000 >= budget.maxTime) break;
 
+    // Format problem with per-iteration shuffle (Poetiq: seed + it)
+    let formattedProblem = problem;
+    if (hasGridData && !problem.includes('<Diagram>')) {
+      formattedProblem = formatProblem(
+        trainInputs as number[][][],
+        trainOutputs as number[][][],
+        testInputs as number[][][],
+        expertConfig.shuffleExamples,
+        expertConfig.seed + it
+      );
+    }
+
     // Build prompt with optional feedback from past solutions
-    let message = expertConfig.solverPrompt.replace('$$problem$$', problem);
+    let message = expertConfig.solverPrompt.replace('$$problem$$', formattedProblem);
 
     if (solutions.length > 0) {
       const selected = solutions.filter(() => rng() < expertConfig.selectionProbability);
@@ -1075,6 +1159,23 @@ function compareOutputs(actual: string, expected: unknown): boolean {
   try {
     const actualParsed = JSON.parse(actual);
     const expectedParsed = Array.isArray(expected) ? expected : JSON.parse(JSON.stringify(expected));
+
+    // Use 2D normalization for grid comparison
+    const pred2D = ensure2D(actualParsed);
+    const truth2D = ensure2D(expectedParsed);
+
+    if (pred2D && truth2D) {
+      const [pr, pc] = gridShape(pred2D);
+      const [tr, tc] = gridShape(truth2D);
+      if (pr !== tr || pc !== tc) return false;
+      for (let i = 0; i < tr; i++) {
+        for (let j = 0; j < tc; j++) {
+          if (pred2D[i][j] !== truth2D[i][j]) return false;
+        }
+      }
+      return true;
+    }
+
     return JSON.stringify(actualParsed) === JSON.stringify(expectedParsed);
   } catch {
     return actual.trim() === String(expected).trim();
@@ -1087,21 +1188,26 @@ function computeSoftScore(actual: string, expected: unknown): number {
     const expectedArr = Array.isArray(expected) ? expected : JSON.parse(JSON.stringify(expected));
 
     if (!Array.isArray(actualArr) || !Array.isArray(expectedArr)) return 0;
-    if (actualArr.length !== expectedArr.length) return 0;
+
+    const pred2D = ensure2D(actualArr);
+    const truth2D = ensure2D(expectedArr);
+
+    if (!pred2D || !truth2D) return 0;
+
+    const [predRows, predCols] = gridShape(pred2D);
+    const [truthRows, truthCols] = gridShape(truth2D);
+
+    // Shape mismatch → 0 (matches Poetiq's _soft_score)
+    if (predRows !== truthRows || predCols !== truthCols) return 0;
+
+    // Empty grid → 1 (trivially correct)
+    if (truthRows === 0 || truthCols === 0) return 1;
 
     let matches = 0;
-    let total = 0;
-    for (let i = 0; i < expectedArr.length; i++) {
-      const aRow = actualArr[i];
-      const eRow = expectedArr[i];
-      if (Array.isArray(aRow) && Array.isArray(eRow)) {
-        for (let j = 0; j < Math.max(aRow.length, eRow.length); j++) {
-          total++;
-          if (j < aRow.length && aRow[j] === eRow[j]) matches++;
-        }
-      } else {
-        total++;
-        if (aRow === eRow) matches++;
+    const total = truthRows * truthCols;
+    for (let i = 0; i < truthRows; i++) {
+      for (let j = 0; j < truthCols; j++) {
+        if (pred2D[i][j] === truth2D[i][j]) matches++;
       }
     }
 
@@ -1111,32 +1217,125 @@ function computeSoftScore(actual: string, expected: unknown): number {
   }
 }
 
+/**
+ * Build detailed feedback for each training example.
+ * Mirrors Poetiq's _build_feedback() — produces element-by-element
+ * diff grids, shape mismatch info, and bad-JSON diagnostics.
+ */
 function buildDetailedFeedback(
   trainResults: SolveResult[],
   _trainInputs: unknown[],
-  _trainOutputs: unknown[]
+  trainOutputs: unknown[]
 ): string {
   const parts: string[] = [];
 
   for (let i = 0; i < trainResults.length; i++) {
     const rr = trainResults[i];
     if (rr.success) {
-      parts.push(`Solves Example #${i + 1} correctly.`);
+      parts.push(`Solves Example #${i + 1} correctly. `);
       continue;
     }
 
-    let msg = `Solves Example #${i + 1} incorrectly.`;
+    const msgLines: string[] = [`Solves Example #${i + 1} incorrectly. `];
 
-    if (rr.error) {
-      msg += `\nError: ${rr.error.slice(0, 300)}`;
+    // Try to parse the model's output as a 2D array
+    let predArr: unknown = null;
+    try {
+      if (rr.output) {
+        predArr = JSON.parse(rr.output);
+      }
+    } catch {}
+
+    const truth = trainOutputs[i];
+    const truthArr = Array.isArray(truth) ? truth : null;
+
+    if (!predArr || !Array.isArray(predArr)) {
+      // Model output couldn't be parsed as a JSON array
+      msgLines.push('\nThe output has to be a rectangular grid of numbers.\n');
+      if (rr.error) {
+        msgLines.push(`Your code produced the following error:\n${rr.error.slice(0, 300)}\n`);
+      }
     } else {
-      msg += `\nOutput accuracy: ${rr.softScore.toFixed(2)} (0 is worst, 1 is best).`;
+      // Normalize to 2D
+      const pred2D = ensure2D(predArr);
+      const truth2D = truthArr ? ensure2D(truthArr) : null;
+
+      if (!truth2D || !pred2D) {
+        msgLines.push('\nFailed to parse grids for comparison.\n');
+      } else {
+        const predShape = gridShape(pred2D);
+        const truthShape = gridShape(truth2D);
+
+        if (predShape[0] !== truthShape[0] || predShape[1] !== truthShape[1]) {
+          // Shape mismatch
+          msgLines.push(
+            `\n\nShape mismatch: your prediction's shape was [${predShape}], ` +
+            `while the correct shape was [${truthShape}].`
+          );
+        } else {
+          // Same shape: show element-by-element diff grid
+          msgLines.push(
+            '\nYour code\'s output does not match the expected output.' +
+            '\n\nBelow is a visualization of the 2D array your code produced as well as the expected output.\n' +
+            'Correctly predicted values are shown as-is while the incorrectly predicted values are shown ' +
+            "in the format 'prediction/correct':\n"
+          );
+          const diff = arrayDiff(pred2D, truth2D);
+          msgLines.push(`\n\`\`\`\n${diff}\n\`\`\`\n`);
+          msgLines.push(`Output accuracy: ${rr.softScore.toFixed(2)} (0 is worst, 1 is best).\n`);
+        }
+      }
+
+      if (rr.error) {
+        msgLines.push(`\n\nYour code produced the following error:\n${rr.error.slice(0, 300)}\n`);
+      }
     }
 
-    parts.push(msg);
+    parts.push(msgLines.join(''));
   }
 
   return parts.join('\n\n');
+}
+
+// =============================================================================
+// Grid utilities — mirrors Poetiq's numpy-based grid ops in pure JS
+// =============================================================================
+
+/** Ensure a value is a 2D array (expand 1D → 2D if needed) */
+function ensure2D(arr: unknown): number[][] | null {
+  if (!Array.isArray(arr)) return null;
+  if (arr.length === 0) return [[]];
+  if (Array.isArray(arr[0])) return arr as number[][];
+  // 1D array → single row
+  return [arr as unknown[] as number[]];
+}
+
+/** Get [rows, cols] of a 2D grid */
+function gridShape(grid: number[][]): [number, number] {
+  return [grid.length, grid.length > 0 ? grid[0].length : 0];
+}
+
+/** Element-by-element diff: matching values as-is, mismatches as 'pred/truth' */
+function arrayDiff(pred: number[][], truth: number[][]): string {
+  const rows = truth.length;
+  const cols = truth.length > 0 ? truth[0].length : 0;
+  const lines: string[] = [];
+  for (let i = 0; i < rows; i++) {
+    const row: string[] = [];
+    const pRow = i < pred.length ? pred[i] : [];
+    const tRow = truth[i];
+    for (let j = 0; j < cols; j++) {
+      const pVal = j < pRow.length ? pRow[j] : '?';
+      const tVal = tRow[j];
+      if (pVal === tVal) {
+        row.push(String(tVal));
+      } else {
+        row.push(`${pVal}/${tVal}`);
+      }
+    }
+    lines.push(row.join(' '));
+  }
+  return lines.join('\n');
 }
 
 // =============================================================================
@@ -1428,13 +1627,13 @@ async function dispatchAction(
         return { text: '❌ No session initialized. Call init first.', details: {} };
       }
 
-      const problem = params.problem as string;
+      const problem = (params.problem as string) || '';
       const trainInputs = (params.trainInputs as unknown[]) || [];
       const trainOutputs = (params.trainOutputs as unknown[]) || [];
       const testInputs = (params.testInputs as unknown[]) || [];
 
-      if (!problem) {
-        return { text: '❌ solve requires a problem.', details: {} };
+      if (!problem && trainInputs.length === 0) {
+        return { text: '❌ solve requires a problem or trainInputs/trainOutputs.', details: {} };
       }
 
       const maxCost = session.taskConfig.maxCostPerProblem;
