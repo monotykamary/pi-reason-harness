@@ -199,6 +199,345 @@ export interface SessionState {
 }
 
 // =============================================================================
+// Meta-system — the brain that generates strategies
+//
+// This IS the secret sauce. The harness is the hand; this is the brain.
+// Three layers:
+//   1. Problem Analyzer: LLM inspects problem → structured strategy
+//   2. Strategy Library: persistent store of proven strategies with ROI data
+//   3. Recursive Improvement: the harness improves its own strategies
+// =============================================================================
+
+interface ProblemFeatures {
+  /** Brief description of what the problem involves */
+  summary: string;
+  /** Problem category detected by the analyzer */
+  category: string;
+  /** Estimated difficulty 0-1 */
+  difficulty: number;
+  /** Key patterns or relationships the LLM noticed */
+  keyPatterns: string[];
+  /** Suggested approach (informs the solver prompt) */
+  suggestedApproach: string;
+  /** Whether code execution is the right path */
+  requiresCode: boolean;
+  /** Suggested number of iterations */
+  suggestedMaxIterations: number;
+  /** Suggested temperature */
+  suggestedTemperature: number;
+  /** Suggested reasoning level */
+  suggestedReasoning: 'off' | 'minimal' | 'low' | 'medium' | 'high';
+  /** Sub-questions for chain-of-questions decomposition */
+  subQuestions: string[];
+  /** Which model this problem is best suited for (if known) */
+  preferredModel: string | null;
+  /** Custom solver prompt generated for this specific problem */
+  customSolverPrompt: string | null;
+  /** Custom feedback prompt generated for this specific problem */
+  customFeedbackPrompt: string | null;
+}
+
+interface StrategyEntry {
+  /** Unique ID */
+  id: string;
+  /** When it was created */
+  created: number;
+  /** Problem category it targets */
+  category: string;
+  /** The solver prompt template */
+  solverPrompt: string;
+  /** The feedback prompt template */
+  feedbackPrompt: string;
+  /** Config overrides (temperature, maxIterations, etc.) */
+  configOverrides: Partial<ExpertConfig>;
+  /** How many times this strategy was used */
+  useCount: number;
+  /** How many times it led to a solved problem */
+  successCount: number;
+  /** Cumulative score (avg across uses) */
+  avgScore: number;
+  /** Cumulative cost */
+  totalCost: number;
+  /** Cumulative time */
+  totalTime: number;
+  /** Models it has been tested with */
+  testedModels: string[];
+  /** Parent strategy it evolved from (for lineage tracking) */
+  parentId: string | null;
+  /** Generation in the evolutionary tree */
+  generation: number;
+}
+
+// =============================================================================
+// Strategy library — persistent store
+// =============================================================================
+
+const STRATEGY_LIB_PATH = process.env.PI_REASON_HARNESS_STRATEGIES ??
+  join(process.env.HOME || '/tmp', '.pi-reason-harness', 'strategies.json');
+
+let strategyLibrary: StrategyEntry[] = [];
+let strategyLibLoaded = false;
+
+function loadStrategyLibrary(): StrategyEntry[] {
+  if (strategyLibLoaded) return strategyLibrary;
+  try {
+    const dir = join(STRATEGY_LIB_PATH, '..');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (fs.existsSync(STRATEGY_LIB_PATH)) {
+      strategyLibrary = JSON.parse(fs.readFileSync(STRATEGY_LIB_PATH, 'utf-8'));
+    }
+  } catch {
+    strategyLibrary = [];
+  }
+  strategyLibLoaded = true;
+  return strategyLibrary;
+}
+
+function saveStrategyLibrary(): void {
+  try {
+    const dir = join(STRATEGY_LIB_PATH, '..');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(STRATEGY_LIB_PATH, JSON.stringify(strategyLibrary, null, 2), 'utf-8');
+  } catch (e) {
+    serverLog(`strategy lib save error: ${e}`);
+  }
+}
+
+function recordStrategyUse(
+  strategyId: string,
+  success: boolean,
+  score: number,
+  cost: number,
+  timeS: number,
+  model: string
+): void {
+  const entry = strategyLibrary.find((s) => s.id === strategyId);
+  if (!entry) return;
+  entry.useCount++;
+  if (success) entry.successCount++;
+  entry.avgScore = (entry.avgScore * (entry.useCount - 1) + score) / entry.useCount;
+  entry.totalCost += cost;
+  entry.totalTime += timeS;
+  if (!entry.testedModels.includes(model)) entry.testedModels.push(model);
+  saveStrategyLibrary();
+}
+
+function findBestStrategy(category: string, models: string[]): StrategyEntry | null {
+  loadStrategyLibrary();
+  const candidates = strategyLibrary
+    .filter((s) => s.category === category || s.category === '*')
+    .filter((s) => s.useCount >= 1)
+    .sort((a, b) => {
+      // ROI: success rate * avg score / cost
+      const roiA = (a.successCount / Math.max(a.useCount, 1)) * a.avgScore / Math.max(a.totalCost, 0.001);
+      const roiB = (b.successCount / Math.max(b.useCount, 1)) * b.avgScore / Math.max(b.totalCost, 0.001);
+      return roiB - roiA;
+    });
+  return candidates[0] || null;
+}
+
+// =============================================================================
+// Problem analyzer — LLM inspects the problem and generates a strategy
+// =============================================================================
+
+const ANALYZER_PROMPT = `You are a meta-reasoning expert. Your job is to analyze a problem and decide the BEST strategy for solving it with an iterative LLM harness.
+
+You are NOT solving the problem. You are designing the APPROACH.
+
+Analyze the problem below and respond in this EXACT JSON format (no markdown, no backticks, just raw JSON):
+
+{
+  "summary": "one-line description of what this problem involves",
+  "category": "one of: grid-transformation, pattern-completion, sequence-prediction, spatial-reasoning, knowledge-synthesis, mathematical, logical-inference, code-generation, other",
+  "difficulty": 0.7,
+  "keyPatterns": ["pattern 1", "pattern 2"],
+  "suggestedApproach": "detailed description of how to attack this",
+  "requiresCode": true,
+  "suggestedMaxIterations": 8,
+  "suggestedTemperature": 1.0,
+  "suggestedReasoning": "high",
+  "subQuestions": ["sub-question 1", "sub-question 2"],
+  "preferredModel": null,
+  "customSolverPrompt": "A complete solver prompt tailored to this problem type. Include specific instructions for what to look for, what to avoid, and what approach to prioritize. Use $$problem$$ as the placeholder for the problem text.",
+  "customFeedbackPrompt": "A complete feedback prompt tailored to this problem type. Use $$feedback$$ as the placeholder for the feedback block."
+}
+
+Rules:
+- customSolverPrompt MUST include $$problem$$ placeholder
+- customFeedbackPrompt MUST include $$feedback$$ placeholder
+- For grid/array problems: requiresCode=true, suggest writing JavaScript
+- For factual questions: requiresCode=false, focus on chain-of-questions
+- For hard problems (difficulty > 0.7): suggest more iterations, lower temperature, higher reasoning
+- For creative/open-ended problems: higher temperature, more diverse approaches
+- preferredModel: if you know a model that excels at this problem type, name it (provider/id format). Otherwise null.
+
+PROBLEM:
+
+$$problem$$`;
+
+async function analyzeProblem(
+  problem: string,
+  modelId: string
+): Promise<ProblemFeatures> {
+  const prompt = ANALYZER_PROMPT.replace('$$problem$$', problem.slice(0, 8000));
+
+  // Use low temperature for structured analysis
+  const result = await callLLM(modelId, prompt, 0.3, 120, 1, 'high');
+
+  // Parse the JSON response
+  let features: ProblemFeatures;
+  try {
+    // Strip any markdown fences the LLM might add
+    let content = result.content.trim();
+    const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (jsonMatch) content = jsonMatch[1].trim();
+
+    const parsed = JSON.parse(content);
+    features = {
+      summary: parsed.summary || 'Unknown problem',
+      category: parsed.category || 'other',
+      difficulty: typeof parsed.difficulty === 'number' ? parsed.difficulty : 0.5,
+      keyPatterns: Array.isArray(parsed.keyPatterns) ? parsed.keyPatterns : [],
+      suggestedApproach: parsed.suggestedApproach || '',
+      requiresCode: parsed.requiresCode !== false,
+      suggestedMaxIterations: parsed.suggestedMaxIterations || 10,
+      suggestedTemperature: parsed.suggestedTemperature ?? 1.0,
+      suggestedReasoning: parsed.suggestedReasoning || 'off',
+      subQuestions: Array.isArray(parsed.subQuestions) ? parsed.subQuestions : [],
+      preferredModel: parsed.preferredModel || null,
+      customSolverPrompt: parsed.customSolverPrompt || null,
+      customFeedbackPrompt: parsed.customFeedbackPrompt || null,
+    };
+  } catch {
+    // Fallback: use default strategy
+    features = {
+      summary: 'Analysis failed — using defaults',
+      category: 'other',
+      difficulty: 0.5,
+      keyPatterns: [],
+      suggestedApproach: '',
+      requiresCode: true,
+      suggestedMaxIterations: 10,
+      suggestedTemperature: 1.0,
+      suggestedReasoning: 'off',
+      subQuestions: [],
+      preferredModel: null,
+      customSolverPrompt: null,
+      customFeedbackPrompt: null,
+    };
+  }
+
+  return features;
+}
+
+// =============================================================================
+// Recursive strategy improvement — the harness improves its own strategies
+// =============================================================================
+
+const META_IMPROVE_PROMPT = `You are a meta-reasoning expert. Below is a problem-solving strategy that has been tested, along with its results. Your job is to analyze what worked, what didn't, and generate an IMPROVED version of the strategy.
+
+## Current Strategy
+Category: $$category$$
+Solver prompt:
+$$solverPrompt$$
+
+Feedback prompt:
+$$feedbackPrompt$$
+
+Config overrides:
+$$configOverrides$$
+
+## Test Results
+Uses: $$useCount$$
+Successes: $$successCount$$
+Average score: $$avgScore$$
+Total cost: $$$$totalCost$$
+Total time: $$totalTime$$s
+Models tested: $$testedModels$$
+
+## Recent Problem Details
+$$recentProblems$$
+
+---
+
+Generate an improved strategy. Respond in EXACT JSON format (no markdown, no backticks, just raw JSON):
+
+{
+  "solverPrompt": "improved solver prompt with $$problem$$ placeholder",
+  "feedbackPrompt": "improved feedback prompt with $$feedback$$ placeholder",
+  "configOverrides": {
+    "temperature": 0.8,
+    "maxIterations": 12,
+    "reasoning": "high"
+  },
+  "rationale": "brief explanation of what you changed and why"
+}
+
+Rules:
+- Keep what works, fix what doesn't
+- If the strategy has low success rate, consider radically different approaches
+- If it has high success rate but low avgScore, focus on quality improvements
+- If it's expensive (high cost/low ROI), optimize for fewer iterations or lower temperature
+- solverPrompt MUST include $$problem$$ placeholder
+- feedbackPrompt MUST include $$feedback$$ placeholder
+- Only include configOverrides that differ from defaults`;
+
+async function improveStrategy(
+  strategy: StrategyEntry,
+  recentProblems: ProblemHistory[],
+  modelId: string
+): Promise<StrategyEntry | null> {
+  const recentStr = recentProblems.slice(-5).map((p) =>
+    `  - ${p.strategyType}: score=${p.bestScore} passed=${p.passed} iters=${p.iterationCount} models=${p.modelsUsed.join(',')}`
+  ).join('\n');
+
+  const prompt = META_IMPROVE_PROMPT
+    .replace('$$category$$', strategy.category)
+    .replace('$$solverPrompt$$', strategy.solverPrompt.slice(0, 2000))
+    .replace('$$feedbackPrompt$$', strategy.feedbackPrompt.slice(0, 1000))
+    .replace('$$configOverrides$$', JSON.stringify(strategy.configOverrides))
+    .replace('$$useCount$$', String(strategy.useCount))
+    .replace('$$successCount$$', String(strategy.successCount))
+    .replace('$$avgScore$$', strategy.avgScore.toFixed(3))
+    .replace('$$totalCost$$', strategy.totalCost.toFixed(4))
+    .replace('$$totalTime$$', strategy.totalTime.toFixed(1))
+    .replace('$$testedModels$$', strategy.testedModels.join(', ') || 'none')
+    .replace('$$recentProblems$$', recentStr || 'no recent data');
+
+  const result = await callLLM(modelId, prompt, 0.5, 120, 1, 'high');
+
+  try {
+    let content = result.content.trim();
+    const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (jsonMatch) content = jsonMatch[1].trim();
+    const parsed = JSON.parse(content);
+
+    if (!parsed.solverPrompt || !parsed.feedbackPrompt) return null;
+
+    const newStrategy: StrategyEntry = {
+      id: randomBytes(4).toString('hex'),
+      created: Date.now(),
+      category: strategy.category,
+      solverPrompt: parsed.solverPrompt,
+      feedbackPrompt: parsed.feedbackPrompt,
+      configOverrides: parsed.configOverrides || {},
+      useCount: 0,
+      successCount: 0,
+      avgScore: 0,
+      totalCost: 0,
+      totalTime: 0,
+      testedModels: [],
+      parentId: strategy.id,
+      generation: strategy.generation + 1,
+    };
+
+    return newStrategy;
+  } catch {
+    return null;
+  }
+}
+
+// =============================================================================
 // Strategy templates — the meta-system's output
 // =============================================================================
 
@@ -1631,6 +1970,7 @@ async function dispatchAction(
       const trainInputs = (params.trainInputs as unknown[]) || [];
       const trainOutputs = (params.trainOutputs as unknown[]) || [];
       const testInputs = (params.testInputs as unknown[]) || [];
+      const useMeta = (params.meta as boolean) || false;
 
       if (!problem && trainInputs.length === 0) {
         return { text: '❌ solve requires a problem or trainInputs/trainOutputs.', details: {} };
@@ -1648,7 +1988,102 @@ async function dispatchAction(
       session.totalCost = 0;
 
       const solveStart = Date.now();
-      const expertConfigs = generateExpertConfigs(session.taskConfig, session.strategyAdaptations);
+
+      // === META-SYSTEM: analyze problem and generate tailored strategy ===
+      let metaFeatures: ProblemFeatures | null = null;
+      let usedStrategyId: string | null = null;
+      let usedCustomPrompts = false;
+
+      if (useMeta && session.taskConfig.models.length > 0) {
+        // Build the problem text for the analyzer
+        let analyzeText = problem;
+        if (!analyzeText && trainInputs.length > 0) {
+          // Generate a preview of the grid data for the analyzer
+          const trainIn = trainInputs as number[][][];
+          const trainOut = trainOutputs as number[][][];
+          analyzeText = `Grid transformation problem with ${trainInputs.length} training examples:\n`;
+          for (let e = 0; e < Math.min(trainIn.length, 2); e++) {
+            analyzeText += `Input ${e+1}: ${JSON.stringify(trainIn[e])} → Output ${e+1}: ${JSON.stringify(trainOut[e])}\n`;
+          }
+        }
+
+        // Step 1: Check strategy library for a proven strategy
+        const bestStrategy = findBestStrategy(
+          session.taskConfig.type === 'code-reasoning' ? 'grid-transformation' : session.taskConfig.type,
+          session.taskConfig.models
+        );
+
+        // Step 2: Analyze the problem with LLM
+        metaFeatures = await analyzeProblem(analyzeText, session.taskConfig.models[0]);
+        session.totalCost += 0; // analyzer cost already tracked by callLLM
+
+        serverLog(`meta-analyze: category=${metaFeatures.category} difficulty=${metaFeatures.difficulty} requiresCode=${metaFeatures.requiresCode}`);
+
+        // Step 3: If library has a better strategy, prefer it (unless custom prompt from analyzer is better)
+        if (bestStrategy && bestStrategy.avgScore > 0.5 && bestStrategy.useCount >= 2) {
+          usedStrategyId = bestStrategy.id;
+          usedCustomPrompts = true;
+          serverLog(`meta: using library strategy ${bestStrategy.id} (avgScore=${bestStrategy.avgScore.toFixed(2)}, uses=${bestStrategy.useCount})`);
+        } else if (metaFeatures.customSolverPrompt) {
+          // Use the analyzer-generated custom prompt
+          usedCustomPrompts = true;
+          serverLog(`meta: using analyzer-generated custom prompt`);
+        }
+      }
+
+      // Generate expert configs — potentially with custom prompts from meta-system
+      let expertConfigs = generateExpertConfigs(session.taskConfig, session.strategyAdaptations);
+
+      if (usedCustomPrompts && metaFeatures) {
+        // Override prompts with meta-system output
+        const bestStrategy = usedStrategyId
+          ? loadStrategyLibrary().find((s) => s.id === usedStrategyId)
+          : null;
+
+        expertConfigs = expertConfigs.map((cfg, i) => {
+          const customCfg = { ...cfg };
+
+          if (bestStrategy) {
+            customCfg.solverPrompt = bestStrategy.solverPrompt;
+            customCfg.feedbackPrompt = bestStrategy.feedbackPrompt;
+            // Apply config overrides from the strategy
+            if (bestStrategy.configOverrides.temperature !== undefined)
+              customCfg.temperature = bestStrategy.configOverrides.temperature;
+            if (bestStrategy.configOverrides.maxIterations !== undefined)
+              customCfg.maxIterations = bestStrategy.configOverrides.maxIterations;
+            if (bestStrategy.configOverrides.reasoning !== undefined)
+              customCfg.reasoning = bestStrategy.configOverrides.reasoning;
+          } else if (metaFeatures.customSolverPrompt) {
+            customCfg.solverPrompt = metaFeatures.customSolverPrompt;
+            if (metaFeatures.customFeedbackPrompt) {
+              customCfg.feedbackPrompt = metaFeatures.customFeedbackPrompt;
+            }
+          }
+
+          // Apply analyzer suggestions
+          if (metaFeatures.suggestedMaxIterations && !bestStrategy) {
+            customCfg.maxIterations = metaFeatures.suggestedMaxIterations;
+          }
+          if (metaFeatures.suggestedTemperature && !bestStrategy) {
+            customCfg.temperature = metaFeatures.suggestedTemperature;
+          }
+          if (metaFeatures.suggestedReasoning && !bestStrategy) {
+            customCfg.reasoning = metaFeatures.suggestedReasoning;
+          }
+
+          // Route to preferred model if the analyzer suggested one
+          if (metaFeatures.preferredModel && i === 0) {
+            const resolved = resolveModel(metaFeatures.preferredModel);
+            if (resolved) {
+              const key = getApiKey(resolved.provider);
+              if (key) customCfg.llmId = metaFeatures.preferredModel;
+            }
+          }
+
+          return customCfg;
+        });
+      }
+
       const allResults: IterationResult[] = [];
 
       const budget = {
@@ -1696,6 +2131,49 @@ async function dispatchAction(
 
       learnFromProblem(session);
 
+      // Record strategy result in library (if meta was used)
+      if (usedStrategyId) {
+        recordStrategyUse(
+          usedStrategyId,
+          passed,
+          bestScore,
+          cost,
+          totalDuration,
+          session.taskConfig.models[0]
+        );
+      }
+
+      // Save successful strategies to library (whether meta or not)
+      if (metaFeatures && (passed || bestScore > 0.3)) {
+        // If we used the meta-system, save the custom strategy
+        if (usedCustomPrompts && !usedStrategyId) {
+          loadStrategyLibrary();
+          const newEntry: StrategyEntry = {
+            id: randomBytes(4).toString('hex'),
+            created: Date.now(),
+            category: metaFeatures.category || session.taskConfig.type,
+            solverPrompt: expertConfigs[0]?.solverPrompt || CODE_REASONING_SOLVER,
+            feedbackPrompt: expertConfigs[0]?.feedbackPrompt || CODE_REASONING_FEEDBACK,
+            configOverrides: {
+              temperature: expertConfigs[0]?.temperature,
+              maxIterations: expertConfigs[0]?.maxIterations,
+              reasoning: expertConfigs[0]?.reasoning,
+            },
+            useCount: 1,
+            successCount: passed ? 1 : 0,
+            avgScore: bestScore,
+            totalCost: cost,
+            totalTime: totalDuration,
+            testedModels: session.taskConfig.models,
+            parentId: null,
+            generation: 0,
+          };
+          strategyLibrary.push(newEntry);
+          saveStrategyLibrary();
+          serverLog(`meta: saved new strategy ${newEntry.id} (category=${newEntry.category}, score=${bestScore.toFixed(2)})`);
+        }
+      }
+
       session.budget.costUsed += cost;
       session.budget.timeUsed += totalDuration;
 
@@ -1705,6 +2183,10 @@ async function dispatchAction(
 
       text += `\nExperts: ${expertConfigs.length} | Models: ${session.taskConfig.models.join(', ')}`;
       text += `\nPrompt tokens: ${session.totalPromptTokens} | Completion tokens: ${session.totalCompletionTokens} | Cost: $${cost.toFixed(4)}`;
+
+      if (metaFeatures) {
+        text += `\n🧠 Meta: category=${metaFeatures.category} difficulty=${metaFeatures.difficulty.toFixed(1)}${usedStrategyId ? ` strategy=${usedStrategyId}` : ' (new custom prompts)'}`;
+      }
 
       if (session.strategyAdaptations.length > 0) {
         text += `\n🧠 ${session.strategyAdaptations.length} strategy adaptation(s) active`;
@@ -1831,6 +2313,114 @@ async function dispatchAction(
       session.problemHistory = [];
       session.budget = { costUsed: 0, timeUsed: 0, problemsSolved: 0, problemsAttempted: 0 };
       return { text: '🧠 Strategy adaptations and problem history cleared.', details: {} };
+    }
+
+    case 'meta-analyze': {
+      if (!session.taskConfig) {
+        return { text: '❌ No session initialized. Call init first.', details: {} };
+      }
+
+      const analyzeProblemText = params.problem as string;
+      if (!analyzeProblemText) {
+        return { text: '❌ meta-analyze requires a problem.', details: {} };
+      }
+
+      const features = await analyzeProblem(analyzeProblemText, session.taskConfig.models[0]);
+
+      let text = `🧠 Problem Analysis:\n`;
+      text += `Category: ${features.category}\n`;
+      text += `Difficulty: ${features.difficulty.toFixed(1)}/1.0\n`;
+      text += `Summary: ${features.summary}\n`;
+      text += `Requires code: ${features.requiresCode ? '✅' : '❌'}\n`;
+      text += `Key patterns: ${features.keyPatterns.join(', ') || 'none detected'}\n`;
+      text += `Suggested approach: ${features.suggestedApproach}\n`;
+      text += `Suggested: ${features.suggestedMaxIterations} iters, temp=${features.suggestedTemperature}, reasoning=${features.suggestedReasoning}\n`;
+      if (features.preferredModel) text += `Preferred model: ${features.preferredModel}\n`;
+      if (features.subQuestions.length > 0) {
+        text += `Sub-questions:\n`;
+        for (const sq of features.subQuestions) {
+          text += `  • ${sq}\n`;
+        }
+      }
+      text += `\nCustom solver prompt: ${features.customSolverPrompt ? '✅ generated' : '❌ using default'}`;
+      text += `\nCustom feedback prompt: ${features.customFeedbackPrompt ? '✅ generated' : '❌ using default'}`;
+
+      // Check library for matching strategy
+      const bestStrategy = findBestStrategy(features.category, session.taskConfig.models);
+      if (bestStrategy) {
+        text += `\n\n📚 Best library strategy: ${bestStrategy.id} (score=${bestStrategy.avgScore.toFixed(2)}, uses=${bestStrategy.useCount}, gen=${bestStrategy.generation})`;
+      } else {
+        text += `\n\n📚 No matching strategy in library.`;
+      }
+
+      return { text, details: { features, bestStrategyId: bestStrategy?.id || null } };
+    }
+
+    case 'meta-improve': {
+      loadStrategyLibrary();
+      if (strategyLibrary.length === 0) {
+        return { text: '📚 No strategies in library to improve. Solve some problems with meta=true first.', details: {} };
+      }
+
+      if (!session.taskConfig) {
+        return { text: '❌ No session initialized. Call init first.', details: {} };
+      }
+
+      // Pick the strategy with most uses but lowest ROI to improve
+      const candidates = [...strategyLibrary]
+        .filter((s) => s.useCount >= 1)
+        .sort((a, b) => {
+          const roiA = (a.successCount / Math.max(a.useCount, 1)) * a.avgScore;
+          const roiB = (b.successCount / Math.max(b.useCount, 1)) * b.avgScore;
+          return roiA - roiB; // worst first
+        });
+
+      const target = candidates[0];
+      if (!target) {
+        return { text: '📚 No improvable strategies found.', details: {} };
+      }
+
+      const improved = await improveStrategy(target, session.problemHistory, session.taskConfig.models[0]);
+
+      if (!improved) {
+        return { text: `❌ Failed to improve strategy ${target.id}. LLM didn't return valid JSON.`, details: { targetId: target.id } };
+      }
+
+      strategyLibrary.push(improved);
+      saveStrategyLibrary();
+
+      let text = `🧠 Strategy Evolution:\n`;
+      text += `Parent: ${target.id} (gen=${target.generation}, score=${target.avgScore.toFixed(2)}, uses=${target.useCount})\n`;
+      text += `Child:  ${improved.id} (gen=${improved.generation})\n`;
+      text += `\nNew solver prompt (${improved.solverPrompt.length} chars):\n${improved.solverPrompt.slice(0, 300)}...\n`;
+      text += `\nNew config overrides: ${JSON.stringify(improved.configOverrides)}`;
+
+      return { text, details: { parentId: target.id, childId: improved.id, generation: improved.generation } };
+    }
+
+    case 'strategies': {
+      loadStrategyLibrary();
+
+      if (strategyLibrary.length === 0) {
+        return { text: '📚 Strategy library is empty. Solve problems with meta=true to build it.', details: { strategies: [] } };
+      }
+
+      const lines = strategyLibrary
+        .sort((a, b) => {
+          const roiA = (a.successCount / Math.max(a.useCount, 1)) * a.avgScore / Math.max(a.totalCost, 0.001);
+          const roiB = (b.successCount / Math.max(b.useCount, 1)) * b.avgScore / Math.max(b.totalCost, 0.001);
+          return roiB - roiA;
+        })
+        .map((s, i) => {
+          const successRate = s.useCount > 0 ? (s.successCount / s.useCount * 100).toFixed(0) : '0';
+          const roi = (s.successCount / Math.max(s.useCount, 1)) * s.avgScore / Math.max(s.totalCost, 0.001);
+          return `${i + 1}. [${s.id}] cat=${s.category} gen=${s.generation} score=${s.avgScore.toFixed(2)} win=${successRate}% uses=${s.useCount} cost=$${s.totalCost.toFixed(3)} ROI=${roi.toFixed(1)}${s.parentId ? ` parent=${s.parentId}` : ''}`;
+        });
+
+      return {
+        text: `📚 Strategy Library (${strategyLibrary.length} strategies):\n${lines.join('\n')}`,
+        details: { strategies: strategyLibrary },
+      };
     }
 
     default:
