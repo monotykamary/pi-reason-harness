@@ -199,25 +199,59 @@ export interface SessionState {
 }
 
 // =============================================================================
-// Meta-system — the brain that generates strategies
+// Meta-system — the proprietary layer, rebuilt from first principles
 //
-// This IS the secret sauce. The harness is the hand; this is the brain.
-// Three layers:
-//   1. Problem Analyzer: LLM inspects problem → structured strategy
-//   2. Strategy Library: persistent store of proven strategies with ROI data
-//   3. Recursive Improvement: the harness improves its own strategies
+// What Poetiq's open-source code shows: a static harness with fixed prompts
+// and hardcoded config. What their blog results prove: a dynamic system that
+// adapts. The gap is THIS code.
+//
+// Five core insights derived from first principles:
+//
+// 1. CRITIQUE, DON'T CREATE — The analyzer should propose TARGETED DELTAS to
+//    proven templates, not write prompts from scratch. Our old analyzer
+//    generated 1-liner prompts that failed. Code review > writing from zero.
+//
+// 2. BUDGET IS A BANDIT — Allocate compute where ROI is highest. Stop experts
+//    that show no progress. Re-explore when stuck. This is how Poetiq hits
+//    "half the cost" — not hard limits, but intelligent allocation.
+//
+// 3. META-RULES COMPOUND — Every strategy improvement extracts a generalizable
+//    PRINCIPLE (e.g., "add worked examples", "lower temp for hard problems").
+//    These principles bias ALL future improvements. The meta-system gets
+//    smarter over time, not just per-category.
+//
+// 4. CROSS-DOMAIN TRANSFER — Grid strategies don't transfer to knowledge
+//    extraction, but the PRINCIPLE does. "Provide concrete examples" works
+//    everywhere. We extract principles from successful strategies and
+//    test them on other categories.
+//
+// 5. AUTO-TRIGGER — The meta-improver runs automatically after every N
+//    problems, on success rate drops, on new categories, and on staleness.
+//    No human in the loop. The system self-improves continuously.
+//
+// Architecture:
+//   Layer 0: Problem Critic — inspects problem, proposes delta to template
+//   Layer 1: Strategy Library — persistent proven strategies with ROI data
+//   Layer 2: Meta-Rule Engine — cross-strategy principles that compound
+//   Layer 3: Budget Bandit — Thompson sampling for compute allocation
+//   Layer 4: Recursive Improvement — evolves strategies, extracts principles
+//   Layer 5: Auto-Trigger — runs improvement automatically
 // =============================================================================
 
+// ---------------------------------------------------------------------------
+// Meta-System Types
+// ---------------------------------------------------------------------------
+
 interface ProblemFeatures {
-  /** Brief description of what the problem involves */
+  /** Brief description */
   summary: string;
-  /** Problem category detected by the analyzer */
+  /** Problem category */
   category: string;
   /** Estimated difficulty 0-1 */
   difficulty: number;
-  /** Key patterns or relationships the LLM noticed */
+  /** Key patterns detected */
   keyPatterns: string[];
-  /** Suggested approach (informs the solver prompt) */
+  /** Suggested approach description */
   suggestedApproach: string;
   /** Whether code execution is the right path */
   requiresCode: boolean;
@@ -229,79 +263,324 @@ interface ProblemFeatures {
   suggestedReasoning: 'off' | 'minimal' | 'low' | 'medium' | 'high';
   /** Sub-questions for chain-of-questions decomposition */
   subQuestions: string[];
-  /** Which model this problem is best suited for (if known) */
+  /** Best model for this problem type (null if unknown) */
   preferredModel: string | null;
-  /** Custom solver prompt generated for this specific problem */
-  customSolverPrompt: string | null;
-  /** Custom feedback prompt generated for this specific problem */
-  customFeedbackPrompt: string | null;
+  /** TARGETED DELTA to the default prompt (NOT a full prompt) */
+  promptDelta: PromptDelta;
+}
+
+/** A targeted modification to a proven prompt template */
+interface PromptDelta {
+  /** Section to insert BEFORE the $$problem$$ placeholder */
+  preProblemInsert: string | null;
+  /** Section to insert AFTER the $$problem$$ placeholder */
+  postProblemInsert: string | null;
+  /** Specific instructions to REPLACE in the template (section header → replacement) */
+  sectionReplacements: Record<string, string>;
+  /** Additional examples to include (problem → solution pairs) */
+  additionalExamples: Array<{ problem: string; solution: string }>;
+  /** Anti-patterns: things the solver should NOT do for this problem type */
+  antiPatterns: string[];
 }
 
 interface StrategyEntry {
-  /** Unique ID */
   id: string;
-  /** When it was created */
   created: number;
-  /** Problem category it targets */
   category: string;
-  /** The solver prompt template */
+  /** The FULL solver prompt (base template + delta applied) */
   solverPrompt: string;
-  /** The feedback prompt template */
+  /** The FULL feedback prompt */
   feedbackPrompt: string;
-  /** Config overrides (temperature, maxIterations, etc.) */
+  /** Config overrides */
   configOverrides: Partial<ExpertConfig>;
-  /** How many times this strategy was used */
+  /** The delta that was applied to produce this prompt (for lineage) */
+  appliedDelta: PromptDelta | null;
   useCount: number;
-  /** How many times it led to a solved problem */
   successCount: number;
-  /** Cumulative score (avg across uses) */
   avgScore: number;
-  /** Cumulative cost */
   totalCost: number;
-  /** Cumulative time */
   totalTime: number;
-  /** Models it has been tested with */
   testedModels: string[];
-  /** Parent strategy it evolved from (for lineage tracking) */
   parentId: string | null;
-  /** Generation in the evolutionary tree */
   generation: number;
+  /** Prompt quality metrics — fast feedback signals */
+  qualityMetrics: PromptQualityMetrics;
 }
 
-// =============================================================================
-// Strategy library — persistent store
-// =============================================================================
+interface PromptQualityMetrics {
+  /** How often does this prompt produce valid code blocks? [0-1] */
+  codeParseRate: number;
+  /** How often does the code run without sandbox errors? [0-1] */
+  sandboxSuccessRate: number;
+  /** Average first-iteration score (before feedback kicks in) [0-1] */
+  avgFirstIterationScore: number;
+  /** Total observations used to compute these rates */
+  observationCount: number;
+}
+
+/** A meta-rule — a generalizable principle extracted from strategy evolution */
+interface MetaRule {
+  id: string;
+  /** The principle in natural language */
+  principle: string;
+  /** Which categories it has been validated on */
+  validatedCategories: string[];
+  /** How many times applying this rule improved a strategy */
+  improvementCount: number;
+  /** How many times it was tested */
+  testCount: number;
+  /** The delta this rule suggests (template for modification) */
+  suggestedDelta: Partial<PromptDelta>;
+  /** Source strategy that inspired this rule */
+  sourceStrategyId: string | null;
+  /** When it was created */
+  created: number;
+  /** Last time it was validated */
+  lastValidated: number;
+}
+
+/** Model routing stats — per model × category */
+interface ModelRouteStats {
+  modelId: string;
+  category: string;
+  uses: number;
+  successes: number;
+  avgScore: number;
+  avgCost: number;
+  avgTime: number;
+}
+
+// ---------------------------------------------------------------------------
+// Layer 0: Problem Critic — "critique, don't create"
+// ---------------------------------------------------------------------------
+
+const CRITIC_PROMPT = `You are a meta-reasoning expert. You will receive a PROVEN solver prompt template and a PROBLEM to solve. Your job is NOT to rewrite the prompt. Your job is to propose TARGETED MODIFICATIONS (deltas) that adapt the proven template to this specific problem type.
+
+Think of this as code review: you don't rewrite the whole file, you propose specific insertions, replacements, and anti-patterns.
+
+## PROVEN SOLVER TEMPLATE (the base prompt that works well in general)
+
+$$baseTemplate$$
+
+## PROBLEM TO ANALYZE
+
+$$problem$$
+
+## YOUR TASK
+
+Analyze the problem and propose targeted modifications. Respond in EXACT JSON format (no markdown, no backticks, just raw JSON):
+
+{
+  "summary": "one-line description",
+  "category": "one of: grid-transformation, pattern-completion, sequence-prediction, spatial-reasoning, knowledge-synthesis, mathematical, logical-inference, code-generation, other",
+  "difficulty": 0.7,
+  "keyPatterns": ["pattern 1", "pattern 2"],
+  "suggestedApproach": "detailed description of how to attack this",
+  "requiresCode": true,
+  "suggestedMaxIterations": 8,
+  "suggestedTemperature": 1.0,
+  "suggestedReasoning": "high",
+  "subQuestions": ["sub-question 1", "sub-question 2"],
+  "preferredModel": null,
+  "promptDelta": {
+    "preProblemInsert": "Specific instructions to add RIGHT BEFORE the problem examples. Focus on what's unique about this problem type. E.g., 'For this type of problem, the key insight is to look for connected components using BFS/DFS.'",
+    "postProblemInsert": "Additional instructions to add AFTER the problem examples. E.g., 'CRITICAL: Your function MUST be named transform() and take a single 2D array. No console.log or test code.'",
+    "sectionReplacements": {},
+    "additionalExamples": [],
+    "antiPatterns": ["Don't write test harness code", "Don't use console.log", "Don't hardcode values from training examples"]
+  }
+}
+
+Rules:
+- preProblemInsert: Focus on problem-specific STRATEGY adjustments (what approach to use, what to look for)
+- postProblemInsert: Focus on FORMAT enforcement (function signature, no I/O, pure function)
+- antiPatterns: Things the solver commonly gets wrong for this problem type
+- Keep the base template's structure — only ADD what's needed
+- For grid/array problems: requiresCode=true, add spatial reasoning hints
+- For factual questions: requiresCode=false, add chain-of-questions decomposition
+- For hard problems (difficulty > 0.7): more iterations, lower temperature, higher reasoning
+- preferredModel: provider/id format or null`;
+
+async function critiqueAndAdapt(
+  problem: string,
+  baseSolverPrompt: string,
+  modelId: string
+): Promise<ProblemFeatures> {
+  // Truncate the base template to fit context window (keep structure, trim examples)
+  const truncatedTemplate = baseSolverPrompt.length > 3000
+    ? baseSolverPrompt.slice(0, 3000) + '\n... [template truncated for analysis]'
+    : baseSolverPrompt;
+
+  const prompt = CRITIC_PROMPT
+    .replace('$$baseTemplate$$', truncatedTemplate)
+    .replace('$$problem$$', problem.slice(0, 4000));
+
+  const result = await callLLM(modelId, prompt, 0.3, 120, 1, 'high');
+
+  try {
+    let content = result.content.trim();
+    const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (jsonMatch) content = jsonMatch[1].trim();
+
+    const parsed = JSON.parse(content);
+    const delta: PromptDelta = {
+      preProblemInsert: parsed.promptDelta?.preProblemInsert || null,
+      postProblemInsert: parsed.promptDelta?.postProblemInsert || null,
+      sectionReplacements: parsed.promptDelta?.sectionReplacements || {},
+      additionalExamples: parsed.promptDelta?.additionalExamples || [],
+      antiPatterns: parsed.promptDelta?.antiPatterns || [],
+    };
+
+    return {
+      summary: parsed.summary || 'Unknown problem',
+      category: parsed.category || 'other',
+      difficulty: typeof parsed.difficulty === 'number' ? parsed.difficulty : 0.5,
+      keyPatterns: Array.isArray(parsed.keyPatterns) ? parsed.keyPatterns : [],
+      suggestedApproach: parsed.suggestedApproach || '',
+      requiresCode: parsed.requiresCode !== false,
+      suggestedMaxIterations: parsed.suggestedMaxIterations || 10,
+      suggestedTemperature: parsed.suggestedTemperature ?? 1.0,
+      suggestedReasoning: parsed.suggestedReasoning || 'off',
+      subQuestions: Array.isArray(parsed.subQuestions) ? parsed.subQuestions : [],
+      preferredModel: parsed.preferredModel || null,
+      promptDelta: delta,
+    };
+  } catch {
+    return {
+      summary: 'Analysis failed — using defaults',
+      category: 'other',
+      difficulty: 0.5,
+      keyPatterns: [],
+      suggestedApproach: '',
+      requiresCode: true,
+      suggestedMaxIterations: 10,
+      suggestedTemperature: 1.0,
+      suggestedReasoning: 'off',
+      subQuestions: [],
+      preferredModel: null,
+      promptDelta: { preProblemInsert: null, postProblemInsert: null, sectionReplacements: {}, additionalExamples: [], antiPatterns: [] },
+    };
+  }
+}
+
+/** Apply a PromptDelta to a base prompt, producing a modified prompt */
+function applyPromptDelta(basePrompt: string, delta: PromptDelta): string {
+  let result = basePrompt;
+
+  // Apply section replacements
+  for (const [section, replacement] of Object.entries(delta.sectionReplacements)) {
+    result = result.replace(section, replacement);
+  }
+
+  // Insert before $$problem$$
+  if (delta.preProblemInsert) {
+    const problemIdx = result.indexOf('$$problem$$');
+    if (problemIdx !== -1) {
+      result = result.slice(0, problemIdx) +
+        '\n\n**Problem-Specific Strategy:**\n' + delta.preProblemInsert + '\n\n' +
+        result.slice(problemIdx);
+    }
+  }
+
+  // Insert after $$problem$$
+  if (delta.postProblemInsert) {
+    result = result.replace('$$problem$$', () => '$$problem$$\n\n**Critical Reminders:**\n' + delta.postProblemInsert);
+  }
+
+  // Add anti-patterns
+  if (delta.antiPatterns.length > 0) {
+    result += '\n\n**DO NOT:**\n' + delta.antiPatterns.map((a, i) => `${i + 1}. ${a}`).join('\n');
+  }
+
+  // Add additional examples
+  if (delta.additionalExamples.length > 0) {
+    const examplesStr = delta.additionalExamples
+      .map((e, i) => `**Custom Example ${i + 1}:**\nProblem: ${e.problem}\nSolution: ${e.solution}`)
+      .join('\n\n');
+    result = result.replace('$$problem$$', () => examplesStr + '\n\n$$problem$$');
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1: Strategy Library — persistent store with ROI data
+// ---------------------------------------------------------------------------
 
 const STRATEGY_LIB_PATH = process.env.PI_REASON_HARNESS_STRATEGIES ??
   join(process.env.HOME || '/tmp', '.pi-reason-harness', 'strategies.json');
 
+const META_RULES_PATH = process.env.PI_REASON_HARNESS_META_RULES ??
+  join(process.env.HOME || '/tmp', '.pi-reason-harness', 'meta-rules.json');
+
+const MODEL_ROUTE_PATH = process.env.PI_REASON_HARNESS_MODEL_ROUTES ??
+  join(process.env.HOME || '/tmp', '.pi-reason-harness', 'model-routes.json');
+
 let strategyLibrary: StrategyEntry[] = [];
 let strategyLibLoaded = false;
+let metaRules: MetaRule[] = [];
+let metaRulesLoaded = false;
+let modelRouteStats: ModelRouteStats[] = [];
+let modelRouteLoaded = false;
+
+function loadJSON<T>(path: string, fallback: T[]): T[] {
+  try {
+    const dir = join(path, '..');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (fs.existsSync(path)) return JSON.parse(fs.readFileSync(path, 'utf-8'));
+  } catch {}
+  return fallback;
+}
+
+function saveJSON(path: string, data: unknown): void {
+  try {
+    const dir = join(path, '..');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (e) {
+    serverLog(`save error for ${path}: ${e}`);
+  }
+}
 
 function loadStrategyLibrary(): StrategyEntry[] {
   if (strategyLibLoaded) return strategyLibrary;
-  try {
-    const dir = join(STRATEGY_LIB_PATH, '..');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    if (fs.existsSync(STRATEGY_LIB_PATH)) {
-      strategyLibrary = JSON.parse(fs.readFileSync(STRATEGY_LIB_PATH, 'utf-8'));
-    }
-  } catch {
-    strategyLibrary = [];
-  }
+  strategyLibrary = loadJSON(STRATEGY_LIB_PATH, []);
   strategyLibLoaded = true;
   return strategyLibrary;
 }
 
 function saveStrategyLibrary(): void {
-  try {
-    const dir = join(STRATEGY_LIB_PATH, '..');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(STRATEGY_LIB_PATH, JSON.stringify(strategyLibrary, null, 2), 'utf-8');
-  } catch (e) {
-    serverLog(`strategy lib save error: ${e}`);
-  }
+  saveJSON(STRATEGY_LIB_PATH, strategyLibrary);
 }
+
+function loadMetaRules(): MetaRule[] {
+  if (metaRulesLoaded) return metaRules;
+  metaRules = loadJSON(META_RULES_PATH, []);
+  metaRulesLoaded = true;
+  return metaRules;
+}
+
+function saveMetaRules(): void {
+  saveJSON(META_RULES_PATH, metaRules);
+}
+
+function loadModelRoutes(): ModelRouteStats[] {
+  if (modelRouteLoaded) return modelRouteStats;
+  modelRouteStats = loadJSON(MODEL_ROUTE_PATH, []);
+  modelRouteLoaded = true;
+  return modelRouteStats;
+}
+
+function saveModelRoutes(): void {
+  saveJSON(MODEL_ROUTE_PATH, modelRouteStats);
+}
+
+const DEFAULT_QUALITY: PromptQualityMetrics = {
+  codeParseRate: 0,
+  sandboxSuccessRate: 0,
+  avgFirstIterationScore: 0,
+  observationCount: 0,
+};
 
 function recordStrategyUse(
   strategyId: string,
@@ -322,179 +601,466 @@ function recordStrategyUse(
   saveStrategyLibrary();
 }
 
+/** Record prompt quality metrics (fast feedback signals) */
+function recordPromptQuality(
+  strategyId: string,
+  codeParsed: boolean,
+  sandboxOk: boolean,
+  firstIterationScore: number
+): void {
+  const entry = strategyLibrary.find((s) => s.id === strategyId);
+  if (!entry) return;
+  const m = entry.qualityMetrics;
+  const n = m.observationCount;
+  m.codeParseRate = (m.codeParseRate * n + (codeParsed ? 1 : 0)) / (n + 1);
+  m.sandboxSuccessRate = (m.sandboxSuccessRate * n + (sandboxOk ? 1 : 0)) / (n + 1);
+  m.avgFirstIterationScore = (m.avgFirstIterationScore * n + firstIterationScore) / (n + 1);
+  m.observationCount = n + 1;
+  saveStrategyLibrary();
+}
+
 function findBestStrategy(category: string, models: string[]): StrategyEntry | null {
   loadStrategyLibrary();
   const candidates = strategyLibrary
     .filter((s) => s.category === category || s.category === '*')
     .filter((s) => s.useCount >= 1)
     .sort((a, b) => {
-      // ROI: success rate * avg score / cost
-      const roiA = (a.successCount / Math.max(a.useCount, 1)) * a.avgScore / Math.max(a.totalCost, 0.001);
-      const roiB = (b.successCount / Math.max(b.useCount, 1)) * b.avgScore / Math.max(b.totalCost, 0.001);
+      // Composite ROI: success * score / cost * quality_boost
+      const qualA = 1 + (a.qualityMetrics.codeParseRate * 0.5 + a.qualityMetrics.sandboxSuccessRate * 0.3);
+      const qualB = 1 + (b.qualityMetrics.codeParseRate * 0.5 + b.qualityMetrics.sandboxSuccessRate * 0.3);
+      const roiA = (a.successCount / Math.max(a.useCount, 1)) * a.avgScore / Math.max(a.totalCost, 0.001) * qualA;
+      const roiB = (b.successCount / Math.max(b.useCount, 1)) * b.avgScore / Math.max(b.totalCost, 0.001) * qualB;
       return roiB - roiA;
     });
   return candidates[0] || null;
 }
 
-// =============================================================================
-// Problem analyzer — LLM inspects the problem and generates a strategy
-// =============================================================================
+// ---------------------------------------------------------------------------
+// Layer 2: Meta-Rule Engine — cross-strategy principles that compound
+// ---------------------------------------------------------------------------
 
-const ANALYZER_PROMPT = `You are a meta-reasoning expert. Your job is to analyze a problem and decide the BEST strategy for solving it with an iterative LLM harness.
+/** Extract meta-rules from a strategy evolution (parent → child) */
+const RULE_EXTRACTOR_PROMPT = `You are a meta-reasoning expert. You have observed a strategy evolution where a child strategy outperformed its parent. Your job is to extract GENERALIZABLE PRINCIPLES from this improvement.
 
-You are NOT solving the problem. You are designing the APPROACH.
+## Parent Strategy
+Category: $$category$$
+Solver prompt (excerpt):
+$$parentPrompt$$
+Config overrides: $$parentConfig$$
+Score: $$parentScore$$ | Uses: $$parentUses$$
 
-Analyze the problem below and respond in this EXACT JSON format (no markdown, no backticks, just raw JSON):
+## Child Strategy (the improvement)
+Solver prompt (excerpt):
+$$childPrompt$$
+Config overrides: $$childConfig$$
+Score: $$childScore$$ | Uses: $$childUses$$
+
+## Key Difference
+$$diffSummary$$
+
+---
+
+Extract 1-3 generalizable principles from this improvement. A principle should be:
+- Abstract enough to apply to OTHER problem categories (not just $$category$$)
+- Concrete enough to translate into specific prompt modifications
+- Falsifiable (we can test it and see if it helps)
+
+Respond in EXACT JSON format (no markdown, no backticks, just raw JSON):
 
 {
-  "summary": "one-line description of what this problem involves",
-  "category": "one of: grid-transformation, pattern-completion, sequence-prediction, spatial-reasoning, knowledge-synthesis, mathematical, logical-inference, code-generation, other",
-  "difficulty": 0.7,
-  "keyPatterns": ["pattern 1", "pattern 2"],
-  "suggestedApproach": "detailed description of how to attack this",
-  "requiresCode": true,
-  "suggestedMaxIterations": 8,
-  "suggestedTemperature": 1.0,
-  "suggestedReasoning": "high",
-  "subQuestions": ["sub-question 1", "sub-question 2"],
-  "preferredModel": null,
-  "customSolverPrompt": "A complete solver prompt tailored to this problem type. Include specific instructions for what to look for, what to avoid, and what approach to prioritize. Use $$problem$$ as the placeholder for the problem text.",
-  "customFeedbackPrompt": "A complete feedback prompt tailored to this problem type. Use $$feedback$$ as the placeholder for the feedback block."
-}
+  "rules": [
+    {
+      "principle": "A concise statement of the principle",
+      "suggestedDelta": {
+        "preProblemInsert": "text to insert before the problem, or null",
+        "postProblemInsert": "text to insert after the problem, or null",
+        "antiPatterns": ["things to avoid"]
+      },
+      "rationale": "Why this principle should generalize"
+    }
+  ]
+}`;
 
-Rules:
-- customSolverPrompt MUST include $$problem$$ placeholder
-- customFeedbackPrompt MUST include $$feedback$$ placeholder
-- For grid/array problems: requiresCode=true, suggest writing JavaScript
-- For factual questions: requiresCode=false, focus on chain-of-questions
-- For hard problems (difficulty > 0.7): suggest more iterations, lower temperature, higher reasoning
-- For creative/open-ended problems: higher temperature, more diverse approaches
-- preferredModel: if you know a model that excels at this problem type, name it (provider/id format). Otherwise null.
-
-PROBLEM:
-
-$$problem$$`;
-
-async function analyzeProblem(
-  problem: string,
+async function extractMetaRules(
+  parent: StrategyEntry,
+  child: StrategyEntry,
   modelId: string
-): Promise<ProblemFeatures> {
-  const prompt = ANALYZER_PROMPT.replace('$$problem$$', problem.slice(0, 8000));
+): Promise<MetaRule[]> {
+  // Compute diff summary
+  const diffLines: string[] = [];
+  if (child.solverPrompt.length !== parent.solverPrompt.length) {
+    diffLines.push(`Prompt length changed: ${parent.solverPrompt.length} → ${child.solverPrompt.length} chars`);
+  }
+  if (child.configOverrides.temperature !== parent.configOverrides.temperature) {
+    diffLines.push(`Temperature: ${parent.configOverrides.temperature} → ${child.configOverrides.temperature}`);
+  }
+  if (child.configOverrides.maxIterations !== parent.configOverrides.maxIterations) {
+    diffLines.push(`Max iterations: ${parent.configOverrides.maxIterations} → ${child.configOverrides.maxIterations}`);
+  }
+  if (child.configOverrides.reasoning !== parent.configOverrides.reasoning) {
+    diffLines.push(`Reasoning: ${parent.configOverrides.reasoning} → ${child.configOverrides.reasoning}`);
+  }
+  if (diffLines.length === 0) diffLines.push('Subtle prompt wording changes');
 
-  // Use low temperature for structured analysis
-  const result = await callLLM(modelId, prompt, 0.3, 120, 1, 'high');
+  const prompt = RULE_EXTRACTOR_PROMPT
+    .replace('$$category$$', child.category)
+    .replace('$$parentPrompt$$', parent.solverPrompt.slice(0, 1500))
+    .replace('$$parentConfig$$', JSON.stringify(parent.configOverrides))
+    .replace('$$parentScore$$', parent.avgScore.toFixed(3))
+    .replace('$$parentUses$$', String(parent.useCount))
+    .replace('$$childPrompt$$', child.solverPrompt.slice(0, 1500))
+    .replace('$$childConfig$$', JSON.stringify(child.configOverrides))
+    .replace('$$childScore$$', child.avgScore.toFixed(3))
+    .replace('$$childUses$$', String(child.useCount))
+    .replace('$$diffSummary$$', diffLines.join('; '));
 
-  // Parse the JSON response
-  let features: ProblemFeatures;
+  const result = await callLLM(modelId, prompt, 0.3, 60, 1, 'high');
+
   try {
-    // Strip any markdown fences the LLM might add
     let content = result.content.trim();
     const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (jsonMatch) content = jsonMatch[1].trim();
-
     const parsed = JSON.parse(content);
-    features = {
-      summary: parsed.summary || 'Unknown problem',
-      category: parsed.category || 'other',
-      difficulty: typeof parsed.difficulty === 'number' ? parsed.difficulty : 0.5,
-      keyPatterns: Array.isArray(parsed.keyPatterns) ? parsed.keyPatterns : [],
-      suggestedApproach: parsed.suggestedApproach || '',
-      requiresCode: parsed.requiresCode !== false,
-      suggestedMaxIterations: parsed.suggestedMaxIterations || 10,
-      suggestedTemperature: parsed.suggestedTemperature ?? 1.0,
-      suggestedReasoning: parsed.suggestedReasoning || 'off',
-      subQuestions: Array.isArray(parsed.subQuestions) ? parsed.subQuestions : [],
-      preferredModel: parsed.preferredModel || null,
-      customSolverPrompt: parsed.customSolverPrompt || null,
-      customFeedbackPrompt: parsed.customFeedbackPrompt || null,
-    };
-  } catch {
-    // Fallback: use default strategy
-    features = {
-      summary: 'Analysis failed — using defaults',
-      category: 'other',
-      difficulty: 0.5,
-      keyPatterns: [],
-      suggestedApproach: '',
-      requiresCode: true,
-      suggestedMaxIterations: 10,
-      suggestedTemperature: 1.0,
-      suggestedReasoning: 'off',
-      subQuestions: [],
-      preferredModel: null,
-      customSolverPrompt: null,
-      customFeedbackPrompt: null,
-    };
-  }
 
-  return features;
+    if (!Array.isArray(parsed.rules)) return [];
+
+    return parsed.rules
+      .filter((r: any) => r.principle && r.suggestedDelta)
+      .map((r: any): MetaRule => ({
+        id: randomBytes(3).toString('hex'),
+        principle: r.principle,
+        validatedCategories: [],
+        improvementCount: 0,
+        testCount: 0,
+        suggestedDelta: r.suggestedDelta || {},
+        sourceStrategyId: child.id,
+        created: Date.now(),
+        lastValidated: 0,
+      }));
+  } catch {
+    return [];
+  }
 }
 
-// =============================================================================
-// Recursive strategy improvement — the harness improves its own strategies
-// =============================================================================
+/** Apply relevant meta-rules as additional deltas to a prompt */
+function applyMetaRules(
+  category: string,
+  difficulty: number
+): PromptDelta {
+  loadMetaRules();
+  const now = Date.now();
+  const STALE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-const META_IMPROVE_PROMPT = `You are a meta-reasoning expert. Below is a problem-solving strategy that has been tested, along with its results. Your job is to analyze what worked, what didn't, and generate an IMPROVED version of the strategy.
+  // Filter to rules validated for this category or universal rules
+  const relevant = metaRules
+    .filter((r) => {
+      const isCategoryMatch = r.validatedCategories.includes(category) || r.validatedCategories.length === 0;
+      const isFresh = now - r.lastValidated < STALE_MS || r.lastValidated === 0;
+      const hasPositiveEvidence = r.improvementCount > 0 || r.testCount < 5; // untested = worth trying
+      return isCategoryMatch && isFresh && hasPositiveEvidence;
+    })
+    .sort((a, b) => {
+      // Prioritize rules with more positive evidence
+      const scoreA = a.improvementCount / Math.max(a.testCount, 1);
+      const scoreB = b.improvementCount / Math.max(b.testCount, 1);
+      return scoreB - scoreA;
+    });
+
+  // Merge top rules into a combined delta
+  const combinedDelta: PromptDelta = {
+    preProblemInsert: null,
+    postProblemInsert: null,
+    sectionReplacements: {},
+    additionalExamples: [],
+    antiPatterns: [],
+  };
+
+  for (const rule of relevant.slice(0, 3)) { // max 3 rules to avoid prompt bloat
+    const d = rule.suggestedDelta;
+    if (d.preProblemInsert) {
+      combinedDelta.preProblemInsert = (combinedDelta.preProblemInsert || '') + '\n' + d.preProblemInsert;
+    }
+    if (d.postProblemInsert) {
+      combinedDelta.postProblemInsert = (combinedDelta.postProblemInsert || '') + '\n' + d.postProblemInsert;
+    }
+    if (d.antiPatterns) {
+      combinedDelta.antiPatterns.push(...d.antiPatterns);
+    }
+    Object.assign(combinedDelta.sectionReplacements, d.sectionReplacements || {});
+  }
+
+  // Apply difficulty-based rules (these are hardcoded meta-principles)
+  if (difficulty > 0.7) {
+    combinedDelta.antiPatterns.push(
+      'Do not use brute-force approaches — they will time out on hard problems',
+      'Do not hardcode values from training examples'
+    );
+  }
+
+  return combinedDelta;
+}
+
+/** Validate a meta-rule by testing it on a category */
+function validateMetaRule(ruleId: string, category: string, improved: boolean): void {
+  loadMetaRules();
+  const rule = metaRules.find((r) => r.id === ruleId);
+  if (!rule) return;
+  rule.testCount++;
+  if (improved) rule.improvementCount++;
+  if (!rule.validatedCategories.includes(category)) rule.validatedCategories.push(category);
+  rule.lastValidated = Date.now();
+  saveMetaRules();
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3: Model Router — Thompson sampling for model selection
+// ---------------------------------------------------------------------------
+
+function recordModelRoute(
+  modelId: string,
+  category: string,
+  success: boolean,
+  score: number,
+  cost: number,
+  timeS: number
+): void {
+  loadModelRoutes();
+  const existing = modelRouteStats.find(
+    (m) => m.modelId === modelId && m.category === category
+  );
+  if (existing) {
+    existing.uses++;
+    if (success) existing.successes++;
+    existing.avgScore = (existing.avgScore * (existing.uses - 1) + score) / existing.uses;
+    existing.avgCost = (existing.avgCost * (existing.uses - 1) + cost) / existing.uses;
+    existing.avgTime = (existing.avgTime * (existing.uses - 1) + timeS) / existing.uses;
+  } else {
+    modelRouteStats.push({
+      modelId,
+      category,
+      uses: 1,
+      successes: success ? 1 : 0,
+      avgScore: score,
+      avgCost: cost,
+      avgTime: timeS,
+    });
+  }
+  saveModelRoutes();
+}
+
+/** Thompson sampling: pick the model with highest expected reward,
+ *  with exploration bonus for under-tested models */
+function thompsonSampleModel(
+  category: string,
+  availableModels: string[]
+): string {
+  if (availableModels.length <= 1) return availableModels[0];
+
+  loadModelRoutes();
+
+  const categoryStats = modelRouteStats.filter(
+    (m) => m.category === category && availableModels.includes(m.modelId)
+  );
+
+  // Thompson sampling with Beta distribution
+  // α = successes + 1, β = (uses - successes) + 1 (Laplace smoothing)
+  let bestModel = availableModels[0];
+  let bestSample = -Infinity;
+
+  for (const model of availableModels) {
+    const stats = categoryStats.find((s) => s.modelId === model);
+    const alpha = (stats ? stats.successes : 0) + 1;
+    const beta = (stats ? stats.uses - stats.successes : 0) + 1;
+
+    // Sample from Beta(alpha, beta) using the gamma trick
+    const sample = betaSample(alpha, beta);
+    // Adjust for cost efficiency
+    const costEfficiency = stats && stats.avgCost > 0
+      ? Math.min(1 / (stats.avgCost * 10), 2) // penalize expensive models
+      : 1;
+    const adjustedSample = sample * costEfficiency;
+
+    if (adjustedSample > bestSample) {
+      bestSample = adjustedSample;
+      bestModel = model;
+    }
+  }
+
+  return bestModel;
+}
+
+/** Simple Beta distribution sampler using gamma ratio */
+function betaSample(alpha: number, beta: number): number {
+  const x = gammaVariate(alpha);
+  const y = gammaVariate(beta);
+  return x / (x + y);
+}
+
+/** Gamma variate using Marsaglia and Tsang's method */
+function gammaVariate(shape: number): number {
+  if (shape < 1) {
+    // Use Ahrens-Dieter: Gamma(shape) = Gamma(shape+1) * U^(1/shape)
+    return gammaVariate(shape + 1) * Math.pow(Math.random(), 1 / shape);
+  }
+  const d = shape - 1 / 3;
+  const c = 1 / Math.sqrt(9 * d);
+  while (true) {
+    let x, v;
+    do {
+      x = randn();
+      v = 1 + c * x;
+    } while (v <= 0);
+    v = v * v * v;
+    const u = Math.random();
+    if (u < 1 - 0.0331 * (x * x) * (x * x)) return d * v;
+    if (Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(v))) return d * v;
+  }
+}
+
+/** Standard normal random variate (Box-Muller) */
+function randn(): number {
+  const u1 = Math.random();
+  const u2 = Math.random();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+
+// ---------------------------------------------------------------------------
+// Layer 4: Budget Bandit — intelligent compute allocation
+// ---------------------------------------------------------------------------
+
+/** Early stopping: should we stop an expert that's making no progress? */
+function shouldStopEarly(
+  iterationHistory: Array<{ score: number; passed: boolean }>,
+  minIterations: number = 3
+): { stop: boolean; reason: string } {
+  if (iterationHistory.length < minIterations) return { stop: false, reason: '' };
+
+  // Check if we've been stuck at the same low score
+  const last3 = iterationHistory.slice(-3);
+  const allFailed = last3.every((r) => !r.passed);
+  const noProgress = last3.every((r) => r.score === last3[0].score) && last3[0].score < 0.5;
+
+  if (allFailed && noProgress) {
+    return { stop: true, reason: `No progress after ${iterationHistory.length} iterations (score stuck at ${last3[0].score.toFixed(2)})` };
+  }
+
+  // Check if score is decreasing (getting worse)
+  if (iterationHistory.length >= 4) {
+    const last4 = iterationHistory.slice(-4);
+    const decreasing = last4.every((r, i) => i === 0 || r.score <= last4[i - 1].score);
+    if (decreasing && last4[3].score < 0.3) {
+      return { stop: true, reason: `Score decreasing over last 4 iterations (latest: ${last4[3].score.toFixed(2)})` };
+    }
+  }
+
+  return { stop: false, reason: '' };
+}
+
+/** Determine if we should re-explore with a different strategy */
+function shouldReExplore(
+  allExpertResults: IterationResult[][],
+  totalIterations: number
+): { reExplore: boolean; reason: string } {
+  // If ALL experts are stuck at 0 after enough iterations, re-explore
+  const allStuck = allExpertResults.every((results) => {
+    const last3 = results.slice(-3);
+    return last3.length >= 3 && last3.every((r) => r.score === 0);
+  });
+
+  if (allStuck && totalIterations >= 5) {
+    return { reExplore: true, reason: 'All experts stuck at score 0 — need a different approach' };
+  }
+
+  return { reExplore: false, reason: '' };
+}
+
+// ---------------------------------------------------------------------------
+// Layer 5: Recursive Strategy Improvement + Auto-Trigger
+// ---------------------------------------------------------------------------
+
+const IMPROVER_PROMPT = `You are a meta-reasoning expert. Below is a problem-solving strategy with its test results. Your job is to generate an IMPROVED version.
 
 ## Current Strategy
-Category: $$category$$
-Solver prompt:
+Category: $$category$$ | Generation: $$generation$$
+Solver prompt (excerpt):
 $$solverPrompt$$
-
-Feedback prompt:
+Feedback prompt (excerpt):
 $$feedbackPrompt$$
-
-Config overrides:
-$$configOverrides$$
+Config overrides: $$configOverrides$$
 
 ## Test Results
-Uses: $$useCount$$
-Successes: $$successCount$$
+Uses: $$useCount$$ | Successes: $$successCount$$
 Average score: $$avgScore$$
-Total cost: $$$$totalCost$$
-Total time: $$totalTime$$s
+Total cost: $$$$totalCost$$ | Total time: $$totalTime$$s
 Models tested: $$testedModels$$
+
+## Prompt Quality Metrics
+Code parse rate: $$codeParseRate$$ | Sandbox success rate: $$sandboxSuccessRate$$
+First-iteration avg score: $$firstIterScore$$
 
 ## Recent Problem Details
 $$recentProblems$$
 
+## Active Meta-Rules (principles that have improved other strategies)
+$$metaRules$$
+
 ---
 
-Generate an improved strategy. Respond in EXACT JSON format (no markdown, no backticks, just raw JSON):
+Generate an improved strategy. The key insight: make TARGETED modifications, don't rewrite from scratch.
+
+Respond in EXACT JSON format (no markdown, no backticks, just raw JSON):
 
 {
-  "solverPrompt": "improved solver prompt with $$problem$$ placeholder",
+  "solverPrompt": "improved solver prompt with $$problem$$ placeholder — modify the existing prompt, don't rewrite",
   "feedbackPrompt": "improved feedback prompt with $$feedback$$ placeholder",
   "configOverrides": {
     "temperature": 0.8,
     "maxIterations": 12,
     "reasoning": "high"
   },
+  "appliedDelta": {
+    "preProblemInsert": "what you added before the problem",
+    "postProblemInsert": "what you added after the problem",
+    "antiPatterns": ["what you told it to avoid"]
+  },
   "rationale": "brief explanation of what you changed and why"
 }
 
 Rules:
-- Keep what works, fix what doesn't
-- If the strategy has low success rate, consider radically different approaches
+- Keep what works, fix what doesn't — TARGETED MODIFICATIONS
+- If codeParseRate is low: enforce code output format more strongly in the prompt
+- If sandboxSuccessRate is low: add error handling instructions
+- If firstIterationScore is low: improve the initial strategy guidance
+- If the strategy has low success rate, try a RADICALLY different approach
 - If it has high success rate but low avgScore, focus on quality improvements
-- If it's expensive (high cost/low ROI), optimize for fewer iterations or lower temperature
+- If it's expensive (high cost/low ROI), optimize for fewer iterations
 - solverPrompt MUST include $$problem$$ placeholder
 - feedbackPrompt MUST include $$feedback$$ placeholder
-- Only include configOverrides that differ from defaults`;
+- Only include configOverrides that differ from defaults
+- Apply relevant meta-rules where appropriate`;
 
 async function improveStrategy(
   strategy: StrategyEntry,
   recentProblems: ProblemHistory[],
   modelId: string
 ): Promise<StrategyEntry | null> {
+  loadMetaRules();
   const recentStr = recentProblems.slice(-5).map((p) =>
     `  - ${p.strategyType}: score=${p.bestScore} passed=${p.passed} iters=${p.iterationCount} models=${p.modelsUsed.join(',')}`
   ).join('\n');
 
-  const prompt = META_IMPROVE_PROMPT
+  const rulesStr = metaRules
+    .filter((r) => r.improvementCount > 0 || r.testCount < 3)
+    .slice(0, 5)
+    .map((r) => `  - [${r.id}] "${r.principle}" (improvements: ${r.improvementCount}/${r.testCount}, categories: ${r.validatedCategories.join(',') || 'untested'})`)
+    .join('\n') || '  (none yet)';
+
+  const m = strategy.qualityMetrics;
+  const prompt = IMPROVER_PROMPT
     .replace('$$category$$', strategy.category)
+    .replace('$$generation$$', String(strategy.generation))
     .replace('$$solverPrompt$$', strategy.solverPrompt.slice(0, 2000))
-    .replace('$$feedbackPrompt$$', strategy.feedbackPrompt.slice(0, 1000))
+    .replace('$$feedbackPrompt$$', strategy.feedbackPrompt.slice(0, 800))
     .replace('$$configOverrides$$', JSON.stringify(strategy.configOverrides))
     .replace('$$useCount$$', String(strategy.useCount))
     .replace('$$successCount$$', String(strategy.successCount))
@@ -502,7 +1068,11 @@ async function improveStrategy(
     .replace('$$totalCost$$', strategy.totalCost.toFixed(4))
     .replace('$$totalTime$$', strategy.totalTime.toFixed(1))
     .replace('$$testedModels$$', strategy.testedModels.join(', ') || 'none')
-    .replace('$$recentProblems$$', recentStr || 'no recent data');
+    .replace('$$codeParseRate$$', m.codeParseRate.toFixed(2))
+    .replace('$$sandboxSuccessRate$$', m.sandboxSuccessRate.toFixed(2))
+    .replace('$$firstIterScore$$', m.avgFirstIterationScore.toFixed(2))
+    .replace('$$recentProblems$$', recentStr || 'no recent data')
+    .replace('$$metaRules$$', rulesStr);
 
   const result = await callLLM(modelId, prompt, 0.5, 120, 1, 'high');
 
@@ -521,6 +1091,7 @@ async function improveStrategy(
       solverPrompt: parsed.solverPrompt,
       feedbackPrompt: parsed.feedbackPrompt,
       configOverrides: parsed.configOverrides || {},
+      appliedDelta: parsed.appliedDelta || null,
       useCount: 0,
       successCount: 0,
       avgScore: 0,
@@ -529,6 +1100,7 @@ async function improveStrategy(
       testedModels: [],
       parentId: strategy.id,
       generation: strategy.generation + 1,
+      qualityMetrics: { ...DEFAULT_QUALITY },
     };
 
     return newStrategy;
@@ -537,8 +1109,76 @@ async function improveStrategy(
   }
 }
 
+/** Auto-trigger conditions for meta-improvement */
+function shouldAutoImprove(session: SessionState): { improve: boolean; reason: string } {
+  const history = session.problemHistory;
+  if (history.length < 3) return { improve: false, reason: '' };
+
+  // Condition 1: Recent success rate dropped
+  const recent = history.slice(-5);
+  const recentSuccessRate = recent.filter((p) => p.passed).length / recent.length;
+  const overall = history.filter((p) => p.passed).length / history.length;
+  if (recentSuccessRate < overall * 0.5 && recent.length >= 3) {
+    return { improve: true, reason: `Recent success rate (${(recentSuccessRate * 100).toFixed(0)}%) dropped below half of overall (${(overall * 100).toFixed(0)}%)` };
+  }
+
+  // Condition 2: New category encountered
+  const categories = new Set(history.slice(0, -1).map((p) => p.strategyType));
+  const lastCategory = history[history.length - 1].strategyType;
+  if (!categories.has(lastCategory)) {
+    return { improve: true, reason: `New category encountered: ${lastCategory}` };
+  }
+
+  // Condition 3: Every 5 problems, run improvement
+  if (history.length % 5 === 0) {
+    return { improve: true, reason: `Periodic improvement (every 5 problems, now at ${history.length})` };
+  }
+
+  return { improve: false, reason: '' };
+}
+
+/** Run auto-improvement if conditions are met */
+async function maybeAutoImprove(
+  session: SessionState,
+  modelId: string
+): Promise<{ improved: boolean; reason: string; childId?: string }> {
+  const { improve, reason } = shouldAutoImprove(session);
+  if (!improve) return { improved: false, reason };
+
+  loadStrategyLibrary();
+  const candidates = strategyLibrary
+    .filter((s) => s.useCount >= 1)
+    .sort((a, b) => {
+      // Worst ROI first — most room for improvement
+      const roiA = (a.successCount / Math.max(a.useCount, 1)) * a.avgScore;
+      const roiB = (b.successCount / Math.max(b.useCount, 1)) * b.avgScore;
+      return roiA - roiB;
+    });
+
+  if (candidates.length === 0) return { improved: false, reason: `${reason} but no strategies in library` };
+
+  const target = candidates[0];
+  const child = await improveStrategy(target, session.problemHistory, modelId);
+
+  if (!child) return { improved: false, reason: `${reason} but LLM didn't return valid strategy` };
+
+  strategyLibrary.push(child);
+  saveStrategyLibrary();
+
+  // Extract meta-rules from the evolution
+  const rules = await extractMetaRules(target, child, modelId);
+  if (rules.length > 0) {
+    metaRules.push(...rules);
+    saveMetaRules();
+    serverLog(`auto-meta: extracted ${rules.length} meta-rule(s) from ${target.id} → ${child.id}`);
+  }
+
+  serverLog(`auto-meta: improved strategy ${target.id} → ${child.id} (reason: ${reason})`);
+  return { improved: true, reason, childId: child.id };
+}
+
 // =============================================================================
-// Strategy templates — the meta-system's output
+// Strategy templates — the base prompts the meta-system modifies
 // =============================================================================
 
 const CODE_REASONING_SOLVER = `You are a world-class expert in solving problems by writing executable JavaScript code. Your approach is methodical, creative, and highly effective. You produce elegant, efficient, and well-documented solutions.
@@ -1989,16 +2629,17 @@ async function dispatchAction(
 
       const solveStart = Date.now();
 
-      // === META-SYSTEM: analyze problem and generate tailored strategy ===
+      // =================================================================
+      // META-SYSTEM V2: critique-don't-create + meta-rules + bandit
+      // =================================================================
       let metaFeatures: ProblemFeatures | null = null;
       let usedStrategyId: string | null = null;
       let usedCustomPrompts = false;
 
       if (useMeta && session.taskConfig.models.length > 0) {
-        // Build the problem text for the analyzer
+        // Build the problem text for the critic
         let analyzeText = problem;
         if (!analyzeText && trainInputs.length > 0) {
-          // Generate a preview of the grid data for the analyzer
           const trainIn = trainInputs as number[][][];
           const trainOut = trainOutputs as number[][][];
           analyzeText = `Grid transformation problem with ${trainInputs.length} training examples:\n`;
@@ -2007,35 +2648,44 @@ async function dispatchAction(
           }
         }
 
-        // Step 1: Check strategy library for a proven strategy
-        const bestStrategy = findBestStrategy(
-          session.taskConfig.type === 'code-reasoning' ? 'grid-transformation' : session.taskConfig.type,
-          session.taskConfig.models
-        );
+        // Layer 1: Check strategy library for a proven strategy
+        const categoryGuess = session.taskConfig.type === 'code-reasoning' ? 'grid-transformation' : session.taskConfig.type;
+        const bestStrategy = findBestStrategy(categoryGuess, session.taskConfig.models);
 
-        // Step 2: Analyze the problem with LLM
-        metaFeatures = await analyzeProblem(analyzeText, session.taskConfig.models[0]);
-        session.totalCost += 0; // analyzer cost already tracked by callLLM
+        // Layer 0: Critique the base template and propose deltas
+        const basePrompt = session.taskConfig.type === 'code-reasoning'
+          ? CODE_REASONING_SOLVER
+          : session.taskConfig.type === 'knowledge-extraction'
+            ? KNOWLEDGE_EXTRACTION_SOLVER
+            : HYBRID_SOLVER;
 
-        serverLog(`meta-analyze: category=${metaFeatures.category} difficulty=${metaFeatures.difficulty} requiresCode=${metaFeatures.requiresCode}`);
+        metaFeatures = await critiqueAndAdapt(analyzeText, basePrompt, session.taskConfig.models[0]);
+        serverLog(`meta-critic: category=${metaFeatures.category} difficulty=${metaFeatures.difficulty} delta=${JSON.stringify({pre: !!metaFeatures.promptDelta.preProblemInsert, post: !!metaFeatures.promptDelta.postProblemInsert, anti: metaFeatures.promptDelta.antiPatterns.length})}`);
 
-        // Step 3: If library has a better strategy, prefer it (unless custom prompt from analyzer is better)
-        if (bestStrategy && bestStrategy.avgScore > 0.5 && bestStrategy.useCount >= 2) {
+        // Layer 1: If library has a proven strategy with high ROI, prefer it
+        if (bestStrategy && bestStrategy.avgScore > 0.5 && (bestStrategy.useCount >= 2 || bestStrategy.qualityMetrics.observationCount >= 1)) {
           usedStrategyId = bestStrategy.id;
           usedCustomPrompts = true;
           serverLog(`meta: using library strategy ${bestStrategy.id} (avgScore=${bestStrategy.avgScore.toFixed(2)}, uses=${bestStrategy.useCount})`);
-        } else if (metaFeatures.customSolverPrompt) {
-          // Use the analyzer-generated custom prompt
+        } else {
+          // Use delta-modified prompt (critique-don't-create)
           usedCustomPrompts = true;
-          serverLog(`meta: using analyzer-generated custom prompt`);
+          serverLog(`meta: applying delta to base template`);
+        }
+
+        // Layer 3: Thompson sampling for model routing
+        if (session.taskConfig.models.length > 1) {
+          const routed = thompsonSampleModel(metaFeatures.category, session.taskConfig.models);
+          if (routed !== session.taskConfig.models[0]) {
+            serverLog(`meta: Thompson sampling routed to ${routed} for category=${metaFeatures.category}`);
+          }
         }
       }
 
-      // Generate expert configs — potentially with custom prompts from meta-system
+      // Generate expert configs
       let expertConfigs = generateExpertConfigs(session.taskConfig, session.strategyAdaptations);
 
       if (usedCustomPrompts && metaFeatures) {
-        // Override prompts with meta-system output
         const bestStrategy = usedStrategyId
           ? loadStrategyLibrary().find((s) => s.id === usedStrategyId)
           : null;
@@ -2044,35 +2694,69 @@ async function dispatchAction(
           const customCfg = { ...cfg };
 
           if (bestStrategy) {
+            // Use proven strategy from library
             customCfg.solverPrompt = bestStrategy.solverPrompt;
             customCfg.feedbackPrompt = bestStrategy.feedbackPrompt;
-            // Apply config overrides from the strategy
             if (bestStrategy.configOverrides.temperature !== undefined)
-              customCfg.temperature = bestStrategy.configOverrides.temperature;
+              customCfg.temperature = bestStrategy.configOverrides.temperature!;
             if (bestStrategy.configOverrides.maxIterations !== undefined)
-              customCfg.maxIterations = bestStrategy.configOverrides.maxIterations;
+              customCfg.maxIterations = bestStrategy.configOverrides.maxIterations!;
             if (bestStrategy.configOverrides.reasoning !== undefined)
-              customCfg.reasoning = bestStrategy.configOverrides.reasoning;
-          } else if (metaFeatures.customSolverPrompt) {
-            customCfg.solverPrompt = metaFeatures.customSolverPrompt;
-            if (metaFeatures.customFeedbackPrompt) {
-              customCfg.feedbackPrompt = metaFeatures.customFeedbackPrompt;
+              customCfg.reasoning = bestStrategy.configOverrides.reasoning!;
+          } else {
+            // Apply delta to base template (critique-don't-create)
+            const basePrompt = cfg.solverPrompt;
+
+            // First apply meta-rules (Layer 2)
+            const metaRuleDelta = applyMetaRules(metaFeatures.category, metaFeatures.difficulty);
+
+            // Then apply the critic's delta (Layer 0)
+            const combinedDelta: PromptDelta = {
+              preProblemInsert: [
+                metaRuleDelta.preProblemInsert,
+                metaFeatures.promptDelta.preProblemInsert
+              ].filter(Boolean).join('\n') || null,
+              postProblemInsert: [
+                metaRuleDelta.postProblemInsert,
+                metaFeatures.promptDelta.postProblemInsert
+              ].filter(Boolean).join('\n') || null,
+              sectionReplacements: {
+                ...metaRuleDelta.sectionReplacements,
+                ...metaFeatures.promptDelta.sectionReplacements,
+              },
+              additionalExamples: [
+                ...metaRuleDelta.additionalExamples,
+                ...metaFeatures.promptDelta.additionalExamples,
+              ],
+              antiPatterns: [
+                ...metaRuleDelta.antiPatterns,
+                ...metaFeatures.promptDelta.antiPatterns,
+              ],
+            };
+
+            customCfg.solverPrompt = applyPromptDelta(basePrompt, combinedDelta);
+
+            // Apply analyzer suggestions for config
+            if (metaFeatures.suggestedMaxIterations) {
+              customCfg.maxIterations = metaFeatures.suggestedMaxIterations;
+            }
+            if (metaFeatures.suggestedTemperature) {
+              customCfg.temperature = metaFeatures.suggestedTemperature;
+            }
+            if (metaFeatures.suggestedReasoning) {
+              customCfg.reasoning = metaFeatures.suggestedReasoning;
             }
           }
 
-          // Apply analyzer suggestions
-          if (metaFeatures.suggestedMaxIterations && !bestStrategy) {
-            customCfg.maxIterations = metaFeatures.suggestedMaxIterations;
-          }
-          if (metaFeatures.suggestedTemperature && !bestStrategy) {
-            customCfg.temperature = metaFeatures.suggestedTemperature;
-          }
-          if (metaFeatures.suggestedReasoning && !bestStrategy) {
-            customCfg.reasoning = metaFeatures.suggestedReasoning;
-          }
-
-          // Route to preferred model if the analyzer suggested one
-          if (metaFeatures.preferredModel && i === 0) {
+          // Layer 3: Thompson model routing
+          if (metaFeatures && session.taskConfig!.models.length > 1) {
+            const routed = thompsonSampleModel(metaFeatures.category, session.taskConfig!.models);
+            const resolved = resolveModel(routed);
+            if (resolved) {
+              const key = getApiKey(resolved.provider);
+              if (key) customCfg.llmId = routed;
+            }
+          } else if (metaFeatures?.preferredModel && i === 0) {
             const resolved = resolveModel(metaFeatures.preferredModel);
             if (resolved) {
               const key = getApiKey(resolved.provider);
@@ -2084,8 +2768,10 @@ async function dispatchAction(
         });
       }
 
+      // =================================================================
+      // SOLVE with budget bandit (Layer 4: early stopping)
+      // =================================================================
       const allResults: IterationResult[] = [];
-
       const budget = {
         maxCost,
         maxTime,
@@ -2093,24 +2779,76 @@ async function dispatchAction(
         costSoFar: session.totalCost,
       };
 
-      const expertPromises = expertConfigs.map((cfg, i) =>
-        solveWithExpert(
-          session,
-          cfg,
-          i,
-          problem,
-          trainInputs,
-          trainOutputs,
-          testInputs,
-          session.taskConfig!.verification,
-          session.taskConfig!.verifyCommand,
-          budget
-        )
-      );
+      // Track per-expert iteration history for early stopping
+      const expertHistories: Map<number, Array<{ score: number; passed: boolean }>> = new Map();
+      for (let i = 0; i < expertConfigs.length; i++) {
+        expertHistories.set(i, []);
+      }
 
-      const expertResults = await Promise.all(expertPromises);
+      // Run experts — with early stopping per expert
+      const expertResults: IterationResult[][] = [];
+
+      if (expertConfigs.length === 1) {
+        // Single expert: run directly
+        const results = await solveWithExpert(
+          session, expertConfigs[0], 0,
+          problem, trainInputs, trainOutputs, testInputs,
+          session.taskConfig!.verification, session.taskConfig!.verifyCommand, budget
+        );
+        expertResults.push(results);
+      } else {
+        // Multiple experts: run in parallel with early stopping via custom wrapper
+        const expertPromises = expertConfigs.map(async (cfg, i) => {
+          // Run with reduced max iterations first, check progress, then continue
+          const halfConfig = { ...cfg, maxIterations: Math.min(3, cfg.maxIterations) };
+          const firstHalf = await solveWithExpert(
+            session, halfConfig, i,
+            problem, trainInputs, trainOutputs, testInputs,
+            session.taskConfig!.verification, session.taskConfig!.verifyCommand, budget
+          );
+
+          // Check if we should continue or stop early
+          const history = firstHalf.map((r) => ({ score: r.score, passed: r.passed }));
+          const stopCheck = shouldStopEarly(history);
+
+          if (stopCheck.stop) {
+            serverLog(`budget-bandit: stopping expert ${i} early — ${stopCheck.reason}`);
+            return firstHalf;
+          }
+
+          // Continue with remaining iterations
+          const remainingIters = cfg.maxIterations - firstHalf.length;
+          if (remainingIters <= 0) return firstHalf;
+
+          const secondConfig = { ...cfg, maxIterations: remainingIters };
+          const secondHalf = await solveWithExpert(
+            session, secondConfig, i,
+            problem, trainInputs, trainOutputs, testInputs,
+            session.taskConfig!.verification, session.taskConfig!.verifyCommand, budget
+          );
+
+          return [...firstHalf, ...secondHalf];
+        });
+
+        const results = await Promise.all(expertPromises);
+        for (const r of results) expertResults.push(r);
+      }
+
       for (const results of expertResults) {
         allResults.push(...results);
+        for (const r of results) {
+          const hist = expertHistories.get(r.expertIndex) || [];
+          hist.push({ score: r.score, passed: r.passed });
+          expertHistories.set(r.expertIndex, hist);
+        }
+      }
+
+      // Layer 4: Check if re-exploration is needed
+      const reExploreCheck = shouldReExplore(expertResults, allResults.length);
+      let reExploreNote = '';
+      if (reExploreCheck.reExplore) {
+        serverLog(`budget-bandit: ${reExploreCheck.reason}`);
+        reExploreNote = `\n⚠️ ${reExploreCheck.reason}`;
       }
 
       session.iterations = allResults;
@@ -2131,23 +2869,42 @@ async function dispatchAction(
 
       learnFromProblem(session);
 
-      // Record strategy result in library (if meta was used)
-      if (usedStrategyId) {
-        recordStrategyUse(
+      // Record prompt quality metrics (fast feedback)
+      if (usedStrategyId && allResults.length > 0) {
+        const firstIter = allResults.find((r) => r.iteration === 0);
+        const codeParsed = allResults.some((r) => r.code && r.code.length > 0);
+        const sandboxOk = allResults.some((r) => r.trainResults.some((tr) => tr.softScore > 0));
+        recordPromptQuality(
           usedStrategyId,
-          passed,
-          bestScore,
-          cost,
-          totalDuration,
-          session.taskConfig.models[0]
+          codeParsed,
+          sandboxOk,
+          firstIter?.score ?? 0
         );
       }
 
-      // Save successful strategies to library (whether meta or not)
+      // Record strategy result in library
+      if (usedStrategyId) {
+        recordStrategyUse(
+          usedStrategyId, passed, bestScore, cost, totalDuration,
+          session.taskConfig.models[0]
+        );
+
+        // Layer 3: Record model routing stats
+        recordModelRoute(
+          expertConfigs[0]?.llmId || session.taskConfig.models[0],
+          metaFeatures?.category || 'other',
+          passed, bestScore, cost, totalDuration
+        );
+      }
+
+      // Save successful strategies to library
       if (metaFeatures && (passed || bestScore > 0.3)) {
-        // If we used the meta-system, save the custom strategy
         if (usedCustomPrompts && !usedStrategyId) {
           loadStrategyLibrary();
+          const firstIter = allResults.find((r) => r.iteration === 0);
+          const codeParsed = allResults.some((r) => r.code && r.code.length > 0);
+          const sandboxOk = allResults.some((r) => r.trainResults.some((tr) => tr.softScore > 0));
+
           const newEntry: StrategyEntry = {
             id: randomBytes(4).toString('hex'),
             created: Date.now(),
@@ -2159,6 +2916,7 @@ async function dispatchAction(
               maxIterations: expertConfigs[0]?.maxIterations,
               reasoning: expertConfigs[0]?.reasoning,
             },
+            appliedDelta: metaFeatures.promptDelta,
             useCount: 1,
             successCount: passed ? 1 : 0,
             avgScore: bestScore,
@@ -2167,29 +2925,62 @@ async function dispatchAction(
             testedModels: session.taskConfig.models,
             parentId: null,
             generation: 0,
+            qualityMetrics: {
+              codeParseRate: codeParsed ? 1 : 0,
+              sandboxSuccessRate: sandboxOk ? 1 : 0,
+              avgFirstIterationScore: firstIter?.score ?? 0,
+              observationCount: 1,
+            },
           };
           strategyLibrary.push(newEntry);
           saveStrategyLibrary();
           serverLog(`meta: saved new strategy ${newEntry.id} (category=${newEntry.category}, score=${bestScore.toFixed(2)})`);
         }
+
+        // Record model routing even without strategy ID
+        recordModelRoute(
+          expertConfigs[0]?.llmId || session.taskConfig.models[0],
+          metaFeatures.category,
+          passed, bestScore, cost, totalDuration
+        );
       }
 
       session.budget.costUsed += cost;
       session.budget.timeUsed += totalDuration;
 
+      // Layer 5: Auto-trigger meta-improvement
+      const autoResult = await maybeAutoImprove(session, session.taskConfig.models[0]);
+      if (autoResult.improved) {
+        serverLog(`auto-meta: triggered improvement — ${autoResult.reason} → child ${autoResult.childId}`);
+      }
+
       let text = passed
         ? `✅ SOLVED in ${totalIters} iterations (${totalDuration.toFixed(1)}s, ${totalTokens} tokens, $${cost.toFixed(4)})`
         : `❌ Not fully solved after ${totalIters} iterations (best score: ${bestScore.toFixed(2)}, ${totalDuration.toFixed(1)}s, $${cost.toFixed(4)})`;
 
-      text += `\nExperts: ${expertConfigs.length} | Models: ${session.taskConfig.models.join(', ')}`;
+      text += `\nExperts: ${expertConfigs.length} | Models: ${expertConfigs.map(c => c.llmId).join(', ')}`;
       text += `\nPrompt tokens: ${session.totalPromptTokens} | Completion tokens: ${session.totalCompletionTokens} | Cost: $${cost.toFixed(4)}`;
 
       if (metaFeatures) {
-        text += `\n🧠 Meta: category=${metaFeatures.category} difficulty=${metaFeatures.difficulty.toFixed(1)}${usedStrategyId ? ` strategy=${usedStrategyId}` : ' (new custom prompts)'}`;
+        const delta = metaFeatures.promptDelta;
+        text += `\n🧠 Meta: category=${metaFeatures.category} difficulty=${metaFeatures.difficulty.toFixed(1)}${usedStrategyId ? ` strategy=${usedStrategyId}` : ' (delta-modified)'} delta={pre:${!!delta.preProblemInsert} post:${!!delta.postProblemInsert} anti:${delta.antiPatterns.length}}`;
+      }
+
+      if (autoResult.improved) {
+        text += `\n🔄 Auto-improved: ${autoResult.reason} → ${autoResult.childId}`;
+      }
+
+      if (reExploreNote) {
+        text += reExploreNote;
       }
 
       if (session.strategyAdaptations.length > 0) {
         text += `\n🧠 ${session.strategyAdaptations.length} strategy adaptation(s) active`;
+      }
+
+      loadMetaRules();
+      if (metaRules.length > 0) {
+        text += `\n📐 ${metaRules.length} meta-rule(s) active`;
       }
 
       if (ranked[0]) {
@@ -2216,6 +3007,8 @@ async function dispatchAction(
             passed: r.passed,
             score: r.score,
           })),
+          autoImproved: autoResult.improved,
+          autoImproveReason: autoResult.reason,
         },
       };
     }
@@ -2325,9 +3118,17 @@ async function dispatchAction(
         return { text: '❌ meta-analyze requires a problem.', details: {} };
       }
 
-      const features = await analyzeProblem(analyzeProblemText, session.taskConfig.models[0]);
+      // Use critique-don't-create: pass the base template to the critic
+      const basePrompt = session.taskConfig.type === 'code-reasoning'
+        ? CODE_REASONING_SOLVER
+        : session.taskConfig.type === 'knowledge-extraction'
+          ? KNOWLEDGE_EXTRACTION_SOLVER
+          : HYBRID_SOLVER;
 
-      let text = `🧠 Problem Analysis:\n`;
+      const features = await critiqueAndAdapt(analyzeProblemText, basePrompt, session.taskConfig.models[0]);
+
+      const delta = features.promptDelta;
+      let text = `🧠 Problem Analysis (critique-don't-create):\n`;
       text += `Category: ${features.category}\n`;
       text += `Difficulty: ${features.difficulty.toFixed(1)}/1.0\n`;
       text += `Summary: ${features.summary}\n`;
@@ -2342,8 +3143,15 @@ async function dispatchAction(
           text += `  • ${sq}\n`;
         }
       }
-      text += `\nCustom solver prompt: ${features.customSolverPrompt ? '✅ generated' : '❌ using default'}`;
-      text += `\nCustom feedback prompt: ${features.customFeedbackPrompt ? '✅ generated' : '❌ using default'}`;
+      text += `\n--- Prompt Delta ---`;
+      text += `\nPre-problem insert: ${delta.preProblemInsert ? '✅ ' + delta.preProblemInsert.slice(0, 200) : '❌ none'}`;
+      text += `\nPost-problem insert: ${delta.postProblemInsert ? '✅ ' + delta.postProblemInsert.slice(0, 200) : '❌ none'}`;
+      text += `\nAnti-patterns (${delta.antiPatterns.length}): ${delta.antiPatterns.join(', ') || 'none'}`;
+      text += `\nAdditional examples: ${delta.additionalExamples.length}`;
+
+      // Show what the modified prompt would look like
+      const modifiedPrompt = applyPromptDelta(basePrompt, delta);
+      text += `\n\n--- Modified Prompt Preview (${modifiedPrompt.length} chars) ---\n${modifiedPrompt.slice(0, 500)}...`;
 
       // Check library for matching strategy
       const bestStrategy = findBestStrategy(features.category, session.taskConfig.models);
@@ -2351,6 +3159,12 @@ async function dispatchAction(
         text += `\n\n📚 Best library strategy: ${bestStrategy.id} (score=${bestStrategy.avgScore.toFixed(2)}, uses=${bestStrategy.useCount}, gen=${bestStrategy.generation})`;
       } else {
         text += `\n\n📚 No matching strategy in library.`;
+      }
+
+      // Show applicable meta-rules
+      const metaRuleDelta = applyMetaRules(features.category, features.difficulty);
+      if (metaRuleDelta.preProblemInsert || metaRuleDelta.antiPatterns.length > 0) {
+        text += `\n📐 Applicable meta-rules: pre=${!!metaRuleDelta.preProblemInsert} anti=${metaRuleDelta.antiPatterns.length}`;
       }
 
       return { text, details: { features, bestStrategyId: bestStrategy?.id || null } };
@@ -2366,7 +3180,7 @@ async function dispatchAction(
         return { text: '❌ No session initialized. Call init first.', details: {} };
       }
 
-      // Pick the strategy with most uses but lowest ROI to improve
+      // Pick the strategy with lowest ROI to improve (worst first)
       const candidates = [...strategyLibrary]
         .filter((s) => s.useCount >= 1)
         .sort((a, b) => {
@@ -2389,13 +3203,31 @@ async function dispatchAction(
       strategyLibrary.push(improved);
       saveStrategyLibrary();
 
+      // Extract meta-rules from the evolution
+      const rules = await extractMetaRules(target, improved, session.taskConfig.models[0]);
+      if (rules.length > 0) {
+        metaRules.push(...rules);
+        saveMetaRules();
+      }
+
       let text = `🧠 Strategy Evolution:\n`;
       text += `Parent: ${target.id} (gen=${target.generation}, score=${target.avgScore.toFixed(2)}, uses=${target.useCount})\n`;
       text += `Child:  ${improved.id} (gen=${improved.generation})\n`;
       text += `\nNew solver prompt (${improved.solverPrompt.length} chars):\n${improved.solverPrompt.slice(0, 300)}...\n`;
       text += `\nNew config overrides: ${JSON.stringify(improved.configOverrides)}`;
 
-      return { text, details: { parentId: target.id, childId: improved.id, generation: improved.generation } };
+      if (improved.appliedDelta) {
+        text += `\n\nApplied delta: pre=${!!improved.appliedDelta.preProblemInsert} post=${!!improved.appliedDelta.postProblemInsert} anti=${improved.appliedDelta.antiPatterns.length}`;
+      }
+
+      if (rules.length > 0) {
+        text += `\n📐 Extracted ${rules.length} meta-rule(s):`;
+        for (const r of rules) {
+          text += `\n  • [${r.id}] ${r.principle}`;
+        }
+      }
+
+      return { text, details: { parentId: target.id, childId: improved.id, generation: improved.generation, extractedRules: rules.length } };
     }
 
     case 'strategies': {
@@ -2407,19 +3239,62 @@ async function dispatchAction(
 
       const lines = strategyLibrary
         .sort((a, b) => {
-          const roiA = (a.successCount / Math.max(a.useCount, 1)) * a.avgScore / Math.max(a.totalCost, 0.001);
-          const roiB = (b.successCount / Math.max(b.useCount, 1)) * b.avgScore / Math.max(b.totalCost, 0.001);
+          const qualA = 1 + (a.qualityMetrics.codeParseRate * 0.5 + a.qualityMetrics.sandboxSuccessRate * 0.3);
+          const qualB = 1 + (b.qualityMetrics.codeParseRate * 0.5 + b.qualityMetrics.sandboxSuccessRate * 0.3);
+          const roiA = (a.successCount / Math.max(a.useCount, 1)) * a.avgScore / Math.max(a.totalCost, 0.001) * qualA;
+          const roiB = (b.successCount / Math.max(b.useCount, 1)) * b.avgScore / Math.max(b.totalCost, 0.001) * qualB;
           return roiB - roiA;
         })
         .map((s, i) => {
           const successRate = s.useCount > 0 ? (s.successCount / s.useCount * 100).toFixed(0) : '0';
           const roi = (s.successCount / Math.max(s.useCount, 1)) * s.avgScore / Math.max(s.totalCost, 0.001);
-          return `${i + 1}. [${s.id}] cat=${s.category} gen=${s.generation} score=${s.avgScore.toFixed(2)} win=${successRate}% uses=${s.useCount} cost=$${s.totalCost.toFixed(3)} ROI=${roi.toFixed(1)}${s.parentId ? ` parent=${s.parentId}` : ''}`;
+          const qual = `parse=${(s.qualityMetrics.codeParseRate * 100).toFixed(0)}% sandbox=${(s.qualityMetrics.sandboxSuccessRate * 100).toFixed(0)}%`;
+          return `${i + 1}. [${s.id}] cat=${s.category} gen=${s.generation} score=${s.avgScore.toFixed(2)} win=${successRate}% uses=${s.useCount} cost=$${s.totalCost.toFixed(3)} ROI=${roi.toFixed(1)} qual={${qual}}${s.parentId ? ` parent=${s.parentId}` : ''}`;
         });
 
       return {
         text: `📚 Strategy Library (${strategyLibrary.length} strategies):\n${lines.join('\n')}`,
         details: { strategies: strategyLibrary },
+      };
+    }
+
+    case 'meta-rules': {
+      loadMetaRules();
+
+      if (metaRules.length === 0) {
+        return { text: '📐 No meta-rules yet. Strategies need to evolve first (use meta-improve or solve with meta=true).', details: { rules: [] } };
+      }
+
+      const lines = metaRules
+        .sort((a, b) => b.improvementCount - a.improvementCount)
+        .map((r, i) => {
+          const successRate = r.testCount > 0 ? (r.improvementCount / r.testCount * 100).toFixed(0) : '?';
+          return `${i + 1}. [${r.id}] "${r.principle}"\n   validated=${r.validatedCategories.join(',') || 'untested'} improvements=${r.improvementCount}/${r.testCount} (${successRate}%)`;
+        });
+
+      return {
+        text: `📐 Meta-Rules (${metaRules.length} rules):\n${lines.join('\n')}`,
+        details: { rules: metaRules },
+      };
+    }
+
+    case 'model-routes': {
+      loadModelRoutes();
+
+      if (modelRouteStats.length === 0) {
+        return { text: '🚦 No model routing data yet. Solve problems with meta=true to build it.', details: { routes: [] } };
+      }
+
+      const lines = modelRouteStats
+        .sort((a, b) => b.avgScore - a.avgScore)
+        .map((m, i) => {
+          const successRate = m.uses > 0 ? (m.successes / m.uses * 100).toFixed(0) : '?';
+          return `${i + 1}. ${m.modelId} (${m.category}): score=${m.avgScore.toFixed(2)} win=${successRate}% uses=${m.uses} cost=$${m.avgCost.toFixed(4)} time=${m.avgTime.toFixed(1)}s`;
+        });
+
+      return {
+        text: `🚦 Model Routes (${modelRouteStats.length} entries):\n${lines.join('\n')}`,
+        details: { routes: modelRouteStats },
       };
     }
 
