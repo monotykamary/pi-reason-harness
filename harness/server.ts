@@ -2025,15 +2025,16 @@ function reallocateBudget(
 
 /** Category similarity map — which categories share deep structure */
 const CATEGORY_ANALOGIES: Record<string, string[]> = {
-  'grid-transformation': ['pattern-completion', 'spatial-reasoning', 'sequence-prediction'],
-  'pattern-completion': ['grid-transformation', 'sequence-prediction'],
-  'sequence-prediction': ['pattern-completion', 'mathematical', 'logical-inference'],
-  'spatial-reasoning': ['grid-transformation', 'pattern-completion'],
-  'knowledge-synthesis': ['logical-inference', 'mathematical'],
-  'mathematical': ['sequence-prediction', 'logical-inference', 'knowledge-synthesis'],
+  'grid-transformation': ['pattern-completion', 'spatial-reasoning', 'sequence-prediction', 'code-generation'],
+  'pattern-completion': ['grid-transformation', 'sequence-prediction', 'spatial-reasoning'],
+  'sequence-prediction': ['pattern-completion', 'mathematical', 'logical-inference', 'grid-transformation'],
+  'spatial-reasoning': ['grid-transformation', 'pattern-completion', 'code-generation'],
+  'knowledge-synthesis': ['logical-inference', 'mathematical', 'chain-of-questions'],
+  'mathematical': ['sequence-prediction', 'logical-inference', 'knowledge-synthesis', 'code-generation'],
   'logical-inference': ['mathematical', 'knowledge-synthesis', 'sequence-prediction'],
-  'code-generation': ['grid-transformation', 'mathematical'],
-  'other': [],
+  'code-generation': ['grid-transformation', 'mathematical', 'spatial-reasoning'],
+  'chain-of-questions': ['knowledge-synthesis', 'logical-inference'],
+  'other': ['grid-transformation', 'code-generation'],
 };
 
 function findAnalogousCategories(category: string): string[] {
