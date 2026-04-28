@@ -316,6 +316,7 @@ Environment:
       const trainInputsRaw = extractFlag(args, 'train-inputs');
       const trainOutputsRaw = extractFlag(args, 'train-outputs');
       const testInputsRaw = extractFlag(args, 'test-inputs');
+      const meta = args.includes('--meta') || args.includes('-m');
 
       if (!problem && !trainInputsRaw) {
         process.stderr.write('Error: solve requires --problem or --train-inputs/--train-outputs.\n');
@@ -352,6 +353,7 @@ Environment:
           trainInputs,
           trainOutputs,
           testInputs,
+          meta,
         })
       );
       break;
@@ -375,6 +377,36 @@ Environment:
 
     case 'reset-learn': {
       await postAction(JSON.stringify({ action: 'reset-learn' }));
+      break;
+    }
+
+    case 'meta-analyze': {
+      const problem = extractFlag(args, 'problem');
+      if (!problem) {
+        process.stderr.write('meta-analyze requires --problem\n');
+        process.exit(1);
+      }
+      await postAction(JSON.stringify({ action: 'meta-analyze', problem }));
+      break;
+    }
+
+    case 'meta-improve': {
+      await postAction(JSON.stringify({ action: 'meta-improve' }));
+      break;
+    }
+
+    case 'strategies': {
+      await postAction(JSON.stringify({ action: 'strategies' }));
+      break;
+    }
+
+    case 'meta-rules': {
+      await postAction(JSON.stringify({ action: 'meta-rules' }));
+      break;
+    }
+
+    case 'model-routes': {
+      await postAction(JSON.stringify({ action: 'model-routes' }));
       break;
     }
 
