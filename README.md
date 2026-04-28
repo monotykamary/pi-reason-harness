@@ -1,25 +1,76 @@
 # pi-reason-harness
 
-Recursive self-improving reasoning harness for [pi](https://github.com/badlogic/pi-mono) — iterate, verify, improve.
+Recursive self-improving reasoning harness — the proprietary layer rebuilt from first principles.
 
-Builds task-specific reasoning strategies on top of any LLM by running iterative solve-verify-feedback loops with multi-expert ensembling, voting, and a meta-system that learns from past problems.
+Builds task-specific reasoning strategies on top of any LLM by running iterative solve-verify-feedback loops with multi-expert ensembling, voting, and a **5-layer meta-system** that discovers, adapts, and evolves strategies autonomously.
 
 **JS-exclusive** — LLM calls go through pi's native LLM infrastructure (`@mariozechner/pi-ai`). Code sandbox uses Node's `vm` module. Zero Python dependency.
 
 ## How It Works
 
-The core insight: **LLMs are amazing knowledge stores, but naive usage fails to extract that knowledge reliably.** Information is fragmented inside the model's weights, and you need intelligent probing strategies to surface and reassemble it.
+The core insight (from first-principles analysis of SOTA reasoning systems): **LLMs are knowledge stores that require intelligent probing strategies to extract reliable answers.** The harness layer (open-source) iteratively generates, verifies, and refines. The meta-system layer (proprietary, rebuilt here) discovers and evolves the strategies themselves.
 
-The harness implements:
+### The 5-Layer Meta-System
 
-1. **Iterative solve-verify-feedback loops** — Generate candidate solutions, verify them (sandbox/self-audit/external), build detailed feedback from failures, inject that feedback into subsequent iterations
-2. **Multi-expert ensembling** — Run multiple experts in parallel with different seeds and models
-3. **Voting and ranking** — Group results by canonical output, rank by vote count with diversity-first ordering
-4. **Self-auditing** — The system decides when it has enough information to terminate (early exit on all-pass or HIGH-confidence audit)
-5. **Soft-score-guided search** — Not just pass/fail; partial credit guides the search toward better solutions
-6. **Self-improving meta-system** — Learns from every problem: model preferences, feedback effectiveness, partial solution patterns, performance adaptations
-7. **Budget tracking** — Token usage, cost, and time tracking with per-problem limits
-8. **Chain-of-questions probing** — For knowledge extraction: hierarchical sub-question decomposition, confidence bucketing, cross-referencing
+| Layer | Name | What it does |
+|-------|------|-------------|
+| 0 | **Problem Critic** | Inspects problems, proposes *targeted deltas* to proven templates (not writing from scratch) |
+| 1 | **Strategy Library** | Persistent store of proven strategies with ROI + quality metrics |
+| 2 | **Meta-Rule Engine** | Extracts cross-strategy principles that compound over time |
+| 3 | **Model Router** | Thompson sampling for intelligent model selection per category |
+| 4 | **Budget Bandit** | Early stopping, budget reallocation, re-exploration when stuck |
+| 5 | **Auto-Trigger** | Self-improvement runs automatically (on success rate drops, new categories, periodic) |
+
+### Layer 0: Critique, Don't Create
+
+The key insight: asking an LLM to write a solver prompt from scratch produces terse, bad prompts. Instead, the critic receives the **proven default template** and proposes **targeted modifications** (deltas):
+
+- `preProblemInsert` — Strategy hints inserted before the problem
+- `postProblemInsert` — Format enforcement after the problem
+- `antiPatterns` — Things the solver should NOT do
+- `additionalExamples` — Worked examples for this problem type
+- `sectionReplacements` — Replacement for specific template sections
+
+This is code review, not code writing. The delta gets applied to the base template via `applyPromptDelta()`, producing a modified prompt that keeps what works and adds what's needed.
+
+### Layer 2: Meta-Rules Compound
+
+When a child strategy outperforms its parent, the meta-rule extractor analyzes the evolution and extracts **1-3 generalizable principles**. These principles apply to OTHER problem categories, not just the source:
+
+> *"Adding worked examples improved grid-transformation by 30% → try it on pattern-completion"*
+
+Rules are filtered by category match, freshness (7-day stale), and positive evidence. Top 3 are merged into solve deltas. Rules get validated every time they're tested, compounding improvements over time.
+
+### Layer 3: Thompson Sampling for Model Routing
+
+Each model is an arm in a multi-armed bandit. Beta(α, β) sampling with Laplace smoothing picks the model most likely to succeed for a given category, with exploration bonus for under-tested models. Cost efficiency adjustment penalizes expensive models.
+
+### Layer 4: Budget Bandit
+
+- **Early stopping**: Stop experts stuck at same low score for 3+ iterations
+- **Decreasing score detection**: Stop when score trends downward over 4+ iterations
+- **Re-exploration**: When ALL experts are stuck at 0, trigger a different approach
+
+### Layer 5: Auto-Trigger
+
+Meta-improvement runs automatically when:
+- Recent success rate drops below half of overall
+- A new problem category is encountered
+- Every 5th problem (periodic)
+
+Each auto-trigger runs strategy improvement + meta-rule extraction.
+
+### The Harness Layer
+
+Below the meta-system, the harness implements the iterative solve loop:
+
+1. **Iterative solve-verify-feedback loops** — Generate code, sandbox-execute, build detailed feedback, inject into next iteration
+2. **Multi-expert ensembling** — Run parallel experts with different seeds/models
+3. **Voting and ranking** — Group by output, rank by vote count, diversity-first
+4. **Poetiq-parity feedback** — Element-by-element diff grids (`prediction/correct` format), shape mismatch detection, bad-JSON diagnostics
+5. **Poetiq-parity formatting** — `<Diagram>` text with Fisher-Yates shuffle per iteration
+6. **Self-audit verification** — LLM checks its own answers for accuracy, consistency, completeness
+7. **Budget tracking** — Per-problem cost/time limits, session-level cumulative tracking
 
 ### Task Types
 
@@ -33,20 +84,20 @@ The harness implements:
 
 | Method | How it works |
 |--------|-------------|
-| `sandbox` | Execute generated JavaScript code in Node vm sandbox, compare output to expected |
+| `sandbox` | Execute JS code in Node vm sandbox, compare output to expected |
 | `self-audit` | LLM checks its own answer for accuracy, consistency, completeness |
 | `external` | Run a custom shell command to verify |
 | `none` | No verification, just record the answer |
 
-### Self-Improvement
+### Persistent Data
 
-The meta-system learns from every problem it attempts:
-- **Model preference tracking** — Records which models succeed on which task types
-- **Feedback effectiveness** — Detects when feedback-driven improvement is working
-- **Partial solution awareness** — Learns that high-scoring near-misses need small fixes
-- **Performance adaptation** — Injects timing-awareness when timeouts are frequent
+The meta-system persists across server restarts at `~/.pi-reason-harness/`:
 
-These adaptations accumulate across problems, making the system progressively better at the task type.
+| File | Contents |
+|------|----------|
+| `strategies.json` | Strategy library with ROI, quality metrics, lineage |
+| `meta-rules.json` | Cross-strategy principles with validation stats |
+| `model-routes.json` | Per model×category routing stats |
 
 ## Quick Start
 
@@ -55,15 +106,26 @@ These adaptations accumulate across problems, making the system progressively be
 pi-reason-harness init --name "ARC solver" --type code-reasoning \
   --models '["anthropic/claude-sonnet-4-5","openai/gpt-4o"]' --num-experts 2
 
-# Solve a problem with verification
-pi-reason-harness solve --problem "Transform the grid..." \
+# Solve with the full meta-system pipeline
+pi-reason-harness solve --meta --problem "Transform the grid..." \
   --train-inputs '[[1,2],[3,4]]' \
   --train-outputs '[[4,3],[2,1]]' \
   --test-inputs '[[5,6]]'
 
-# Knowledge extraction with self-audit
-pi-reason-harness init --name "HLE" --type knowledge-extraction --verification self-audit
-pi-reason-harness solve --problem "Who was the first person to..."
+# Analyze a problem without solving
+pi-reason-harness meta-analyze --problem "Rotate a 2x2 grid 90 degrees clockwise"
+
+# Check the strategy library
+pi-reason-harness strategies
+
+# Check meta-rules
+pi-reason-harness meta-rules
+
+# Manually trigger strategy improvement
+pi-reason-harness meta-improve
+
+# Check model routing stats
+pi-reason-harness model-routes
 
 # Check what the system has learned
 pi-reason-harness learn
@@ -75,43 +137,67 @@ pi-reason-harness init --name "budget test" --type code-reasoning --max-cost 0.5
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│  META-SYSTEM (strategy discovery + learning)     │
-│  - Selects prompt templates by task type         │
-│  - Applies learned strategy adaptations          │
-│  - Tracks model preferences                      │
-│  - Detects feedback effectiveness                │
-│  - Budget enforcement                            │
-└──────────────┬───────────────────────────────────┘
-               │ generates (with adaptations)
-               ▼
-┌──────────────────────────────────────────────────┐
-│  TASK-SPECIFIC HARNESS                           │
-│                                                  │
-│  ┌───────────┐  ┌───────────┐  ┌───────────┐     │
-│  │ Expert 1  │  │ Expert 2  │  │ Expert N  │     │
-│  │ (pi-ai    │  │ (pi-ai    │  │ (pi-ai    │     │
-│  │ LLM call  │  │ LLM call  │  │ LLM call  │     │
-│  │ + sandbox │  │ + sandbox │  │ + sandbox │     │
-│  │ /audit    │  │ /audit    │  │ /audit    │     │
-│  │ + verify  │  │ + verify  │  │ + verify  │     │
-│  │ + feedback│  │ + feedback│  │ + feedback│     │
-│  │ loop)     │  │ loop)     │  │ loop)     │     │
-│  └────┬───── ┘  └───┬───────┘  └──┬────────┘     │
-│       └─────────────┼─────────────┘              │
-│                     ▼                            │
-│              VOTING / RANKING                    │
-│              (group by output,                   │
-│               most-voted wins,                   │
-│               diversity-first)                   │
-│                     │                            │
-│                     ▼                            │
-│              LEARN & ADAPT                       │
-│              (update strategy adaptations)       │
-└──────────────────────────────────────────────────┘
-               │
-               ▼
-          Best Solution + Insights
+┌─────────────────────────────────────────────────────────┐
+│  META-SYSTEM V2 (5 layers — the proprietary layer)      │
+│                                                         │
+│  Layer 0: Problem Critic                                │
+│    - critiqueAndAdapt(): receives base template,        │
+│      proposes PromptDelta (not writing from scratch)     │
+│    - applyPromptDelta(): base + delta = modified prompt  │
+│                                                         │
+│  Layer 1: Strategy Library                               │
+│    - Persistent strategies with ROI + quality metrics    │
+│    - findBestStrategy(): retrieves highest-ROI match     │
+│    - recordPromptQuality(): fast feedback signals        │
+│                                                         │
+│  Layer 2: Meta-Rule Engine                               │
+│    - extractMetaRules(): parent→child evolution → rules  │
+│    - applyMetaRules(): merges relevant rules into delta  │
+│    - validateMetaRule(): tracks improvement/test counts  │
+│                                                         │
+│  Layer 3: Model Router (Thompson Sampling)               │
+│    - thompsonSampleModel(): Beta(α,β) sampling          │
+│    - Cost efficiency adjustment                          │
+│    - recordModelRoute(): per model×category stats        │
+│                                                         │
+│  Layer 4: Budget Bandit                                  │
+│    - shouldStopEarly(): stuck at same low score          │
+│    - shouldReExplore(): all experts stuck at 0           │
+│                                                         │
+│  Layer 5: Auto-Trigger                                   │
+│    - shouldAutoImprove(): success rate drop, new cat,   │
+│      periodic (every 5 problems)                         │
+│    - maybeAutoImprove(): runs improvement + extraction   │
+└───────────────────────┬─────────────────────────────────┘
+                        │ generates (with deltas + rules)
+                        ▼
+┌─────────────────────────────────────────────────────────┐
+│  HARNESS (iterative solve-verify-feedback)              │
+│                                                         │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐          │
+│  │ Expert 1  │  │ Expert 2  │  │ Expert N  │          │
+│  │ (pi-ai    │  │ (pi-ai    │  │ (pi-ai    │          │
+│  │ LLM call  │  │ LLM call  │  │ LLM call  │          │
+│  │ + sandbox │  │ + sandbox │  │ + sandbox │          │
+│  │ + verify  │  │ + verify  │  │ + verify  │          │
+│  │ + feedback│  │ + feedback│  │ + feedback│          │
+│  │ loop)     │  │ loop)     │  │ loop)     │          │
+│  └────┬──────┘  └───┬───────┘  └──┬────────┘          │
+│       └─────────────┼─────────────┘                    │
+│                     ▼                                   │
+│              VOTING / RANKING                           │
+│              (group by output,                          │
+│               most-voted wins,                          │
+│               diversity-first)                          │
+│                     │                                   │
+│                     ▼                                   │
+│              LEARN & ADAPT                              │
+│              (update strategies, record routes,         │
+│               extract rules, auto-improve)              │
+└─────────────────────────────────────────────────────────┘
+                        │
+                        ▼
+                   Best Solution + Insights
 ```
 
 ## CLI Reference
@@ -125,6 +211,11 @@ pi-reason-harness init --name "budget test" --type code-reasoning --max-cost 0.5
 | `learn` | Inspect strategy adaptations |
 | `reset-learn` | Clear learned strategies |
 | `clear` | Clear session |
+| `meta-analyze` | Analyze a problem with the critic (no solving) |
+| `meta-improve` | Manually trigger strategy evolution + rule extraction |
+| `strategies` | List strategy library with ROI + quality metrics |
+| `meta-rules` | List meta-rules with validation stats |
+| `model-routes` | List model routing stats per model×category |
 
 ### init flags
 
@@ -132,21 +223,7 @@ pi-reason-harness init --name "budget test" --type code-reasoning --max-cost 0.5
 
 ### solve flags
 
-`--problem`, `--train-inputs`, `--train-outputs`, `--test-inputs`
-
-## Installation
-
-```bash
-pi install git:github.com/user/pi-reason-harness
-```
-
-Or clone and link:
-
-```bash
-git clone https://github.com/user/pi-reason-harness.git
-cd pi-reason-harness
-npm install
-```
+`--problem`, `--train-inputs`, `--train-outputs`, `--test-inputs`, `--meta` / `-m`
 
 ## LLM Integration
 
@@ -155,6 +232,7 @@ The harness uses `@mariozechner/pi-ai` for all LLM calls. Models are specified i
 - `ANTHROPIC_API_KEY` — Anthropic models
 - `OPENAI_API_KEY` — OpenAI models
 - `GEMINI_API_KEY` — Google models
+- `GROQ_API_KEY` — Groq models
 - etc.
 
 No additional setup required — if pi can call the model, so can the harness.
@@ -164,6 +242,8 @@ No additional setup required — if pi can call the model, so can the harness.
 ```bash
 npm test
 ```
+
+69 tests covering: vm sandbox, formatProblem, arrayDiff, buildDetailedFeedback, PromptDelta application, budget bandit (early stopping, re-exploration), Thompson sampling (Beta distribution), meta-rule engine (validation, filtering), prompt quality metrics.
 
 ## License
 
