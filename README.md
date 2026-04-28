@@ -261,52 +261,52 @@ pi-reason-harness model-routes
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  META-SYSTEM V3 (16 layers — the proprietary layer)      │
-│                                                         │
-│  Layer 0: Problem Critic (critique-don't-create)       │
-│  Layer 1: Strategy Library (ROI + quality metrics)      │
-│  Layer 2: Meta-Rule Engine (cross-strategy principles)  │
-│  Layer 3: Model Router (Thompson sampling)              │
-│  Layer 4: Budget Bandit (early stopping + re-explore)   │
-│  Layer 5: Auto-Trigger (self-improving loop)            │
+┌───────────────────────────────────────────────────────────┐
+│  META-SYSTEM V3 (16 layers — the proprietary layer)       │
+│                                                           │
+│  Layer 0: Problem Critic (critique-don't-create)          │
+│  Layer 1: Strategy Library (ROI + quality metrics)        │
+│  Layer 2: Meta-Rule Engine (cross-strategy principles)    │
+│  Layer 3: Model Router (Thompson sampling)                │
+│  Layer 4: Budget Bandit (early stopping + re-explore)     │
+│  Layer 5: Auto-Trigger (self-improving loop)              │
 │  Layer 6: Recursive Harness Generation (solver-of-solvers)│
-│  Layer 7: Ensemble Diversification (different approaches)│
-│  Layer 8: Sub-problem Decomposition (break & combine)   │
-│  Layer 9: Budget Optimization (marginal ROI realloc)   │
-│  Layer 10: Cross-Domain Transfer (analogous categories) │
-│  Layer 11: Confidence-Weighted Voting (quality-ranked)  │
-│  Layer 12: Progressive Difficulty (easiest-first)       │
-│  Layer 13: Auto-Transfer (new category handling)        │
-│  Layer 14: Per-Problem Prompt Synthesis (novel types)   │
-│  Layer 15: Meta-Meta Level (harness-of-harnesses)        │
-│  Layer 16: Gradient-Based Budget Optimization            │
+│  Layer 7: Ensemble Diversification (different approaches) │
+│  Layer 8: Sub-problem Decomposition (break & combine)     │
+│  Layer 9: Budget Optimization (marginal ROI realloc)      │
+│  Layer 10: Cross-Domain Transfer (analogous categories)   │
+│  Layer 11: Confidence-Weighted Voting (quality-ranked)    │
+│  Layer 12: Progressive Difficulty (easiest-first)         │
+│  Layer 13: Auto-Transfer (new category handling)          │
+│  Layer 14: Per-Problem Prompt Synthesis (novel types)     │
+│  Layer 15: Meta-Meta Level (harness-of-harnesses)         │
+│  Layer 16: Gradient-Based Budget Optimization             │
 │  Layer 17: Recursive Meta-Meta Nesting (harness↔solve)    │
-│  Layer 18: Multi-Model Decomposition (model routing)     │
-│  Layer 19: Per-Iteration Prompt Adaptation (mid-solve)   │
-│  Layer 20: ARC-AGI Benchmark Integration (validation)   │
-└───────────────────────┬─────────────────────────────────┘
+│  Layer 18: Multi-Model Decomposition (model routing)      │
+│  Layer 19: Per-Iteration Prompt Adaptation (mid-solve)    │
+│  Layer 20: ARC-AGI Benchmark Integration (validation)     │
+└───────────────────────┬───────────────────────────────────┘
                         │ generates (with deltas + rules + specs)
                         ▼
 ┌─────────────────────────────────────────────────────────┐
 │  HARNESS (iterative solve-verify-feedback)              │
 │                                                         │
-│  ┌───────────┐  ┌───────────┐  ┌───────────┐          │
-│  │ Expert 1  │  │ Expert 2  │  │ Expert N  │          │
-│  │ code-sandbox│ │ decomposition│ │ analogy   │          │
-│  │ (pi-ai    │  │ (pi-ai    │  │ (pi-ai    │          │
-│  │  LLM call │  │  LLM call │  │  LLM call │          │
-│  │  + sandbox│  │  + sub-   │  │  + analogy │          │
-│  │  + verify │  │  solve    │  │  + verify  │          │
-│  │  + feedback│ │  + combine│  │  + feedback│          │
-│  └────┬──────┘  └───┬───────┘  └──┬────────┘          │
-│       └─────────────┼─────────────┘                    │
+│  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐     │
+│  │ Expert 1    │  │ Expert 2     │  │ Expert N    │     │
+│  │ code-sandbox│  │ decomposition│  │ analogy     │     │
+│  │ (pi-ai      │  │ (pi-ai       │  │ (pi-ai      │     │
+│  │  LLM call   │  │  LLM call    │  │  LLM call   │     │
+│  │  + sandbox  │  │  + sub-      │  │  + analogy  │     │
+│  │  + verify   │  │  solve       │  │  + verify   │     │
+│  │  + feedback │  │  + combine   │  │  + feedback │     │
+│  └────┬────────┘  └─┬────────────┘  └──┬──────────┘     │
+│       └─────────────┼──────────────────┘                │
 │                     ▼                                   │
-│     CONFIDENCE-WEIGHTED VOTING                         │
-│     (group by output, rank by confidence)              │
+│     CONFIDENCE-WEIGHTED VOTING                          │
+│     (group by output, rank by confidence)               │
 │                     │                                   │
 │                     ▼                                   │
-│     LEARN + ADAPT + EVOLVE + TRANSFER                  │
+│     LEARN + ADAPT + EVOLVE + TRANSFER                   │
 │     (update strategies, extract rules, evolve specs,    │
 │      transfer to new categories, auto-improve)          │
 └─────────────────────────────────────────────────────────┘
