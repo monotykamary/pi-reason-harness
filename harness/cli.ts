@@ -456,6 +456,28 @@ Environment:
       break;
     }
 
+    case 'arc-benchmark': {
+      const dataPath = extractFlag(args, 'data-path');
+      const maxChallenges = extractFlag(args, 'max-challenges');
+      await postAction(JSON.stringify({
+        action: 'arc-benchmark',
+        ...(dataPath ? { dataPath } : {}),
+        ...(maxChallenges ? { maxChallenges: parseInt(maxChallenges) } : {}),
+      }));
+      break;
+    }
+
+    case 'route-decompose': {
+      const problem = extractFlag(args, 'problem');
+      if (!problem) {
+        process.stderr.write('route-decompose requires --problem\n');
+        process.exit(1);
+      }
+      const doSolve = args.includes('--solve');
+      await postAction(JSON.stringify({ action: 'route-decompose', problem, solve: doSolve }));
+      break;
+    }
+
     case 'clear': {
       await postAction(JSON.stringify({ action: 'clear' }));
       break;

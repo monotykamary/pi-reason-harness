@@ -82,8 +82,10 @@ pi-reason-harness model-routes
 | `pi-reason-harness synth-prompts` | List synthesized prompts |
 | `pi-reason-harness meta-harnesses` | List meta-harnesses |
 | `pi-reason-harness generate-meta-harness` | Generate new approach type |
+| `pi-reason-harness arc-benchmark` | Run ARC-AGI benchmark |
+| `pi-reason-harness route-decompose --problem '...'` | Multi-model decomposition |
 
-## The 16-Layer Meta-System
+## The 20-Layer Meta-System
 
 | Layer | Name | What it does |
 |-------|------|-------------|
@@ -103,6 +105,10 @@ pi-reason-harness model-routes
 | 14 | Per-Problem Prompt Synthesis | Generate + validate prompts for novel types |
 | 15 | Meta-Meta Level | Harness-of-harnesses — new approach types |
 | 16 | Gradient-Based Budget Optimization | Trajectory-based improvement estimation |
+| 17 | Recursive Meta-Meta Nesting | Meta-harnesses feed back into solve |
+| 18 | Multi-Model Decomposition | Route sub-questions to different models |
+| 19 | Per-Iteration Prompt Adaptation | Evolve prompt mid-solve |
+| 20 | ARC-AGI Benchmark Integration | Validate against real challenges |
 
 ## Approach Types (Ensemble Diversification)
 

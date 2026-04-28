@@ -2935,6 +2935,471 @@ function shouldSwitchApproach(trajectory: ExpertTrajectory): boolean {
 }
 
 // ===========================================================================
+// Layer 17: Recursive Meta-Meta Nesting — meta-harnesses feed back into solve
+// ============================================================================
+
+/** Select the best meta-harness for a category and integrate it as an expert config */
+function selectMetaHarnessExpertConfig(
+  category: string,
+  baseConfig: ExpertConfig,
+  numExperts: number
+): ExpertConfig | null {
+  loadMetaHarnesses();
+  const eligible = metaHarnesses
+    .filter(m => m.useCount === 0 || m.avgScore > 0.3)
+    .sort((a, b) => {
+      // Prefer: validated > unvalidated, then by avgScore desc, then by generation desc
+      if (a.avgScore > 0 && b.avgScore === 0) return -1;
+      if (a.avgScore === 0 && b.avgScore > 0) return 1;
+      if (a.generation !== b.generation) return b.generation - a.generation;
+      return b.avgScore - a.avgScore;
+    });
+
+  if (eligible.length === 0) return null;
+
+  const mh = eligible[0];
+  return {
+    ...baseConfig,
+    solverPrompt: mh.solverPrompt,
+    temperature: mh.configOverrides.temperature ?? baseConfig.temperature,
+    maxIterations: mh.configOverrides.maxIterations ?? baseConfig.maxIterations,
+    reasoning: mh.configOverrides.reasoning ?? baseConfig.reasoning,
+    // Tag the expert so we can track meta-harness performance
+    _metaHarnessId: mh.id,
+  } as ExpertConfig & { _metaHarnessId: string };
+}
+
+/** Record the result of using a meta-harness in a solve */
+function recordMetaHarnessUse(metaHarnessId: string, passed: boolean, score: number, cost: number, duration: number) {
+  loadMetaHarnesses();
+  const mh = metaHarnesses.find(m => m.id === metaHarnessId);
+  if (!mh) return;
+  mh.useCount++;
+  if (passed) mh.successCount++;
+  mh.avgScore = mh.useCount === 1 ? score : (mh.avgScore * (mh.useCount - 1) + score) / mh.useCount;
+  saveMetaHarnesses();
+}
+
+/** Recursively evolve all meta-harnesses that have been used but underperform */
+async function recursiveMetaEvolve(modelId: string, maxGenerations: number = 3): Promise<MetaHarness[]> {
+  loadMetaHarnesses();
+  const evolved: MetaHarness[] = [];
+
+  const underperforming = metaHarnesses.filter(
+    m => m.useCount >= 2 && m.avgScore < 0.5 && m.generation < maxGenerations
+  );
+
+  for (const mh of underperforming) {
+    const child = await evolveMetaHarness(mh.id, modelId);
+    if (child) {
+      evolved.push(child);
+      serverLog(`meta-meta-recursive: evolved ${mh.name} (gen=${mh.generation}) → ${child.name} (gen=${child.generation})`);
+    }
+  }
+
+  return evolved;
+}
+
+// ===========================================================================
+// Layer 18: Multi-Model Decomposition — route sub-questions to different models
+// ============================================================================
+
+const DECOMPOSITION_ROUTER_PROMPT = `You are a task decomposition and model routing expert. Given a problem and a list of available models, break the problem into sub-problems and assign each to the best-suited model.
+
+Available models:
+$$models$$
+
+Problem:
+$$problem$$
+
+For each sub-problem, specify:
+1. A clear description of what it requires
+2. Which model is best suited (based on the model's known strengths)
+3. Whether it can be solved independently or depends on previous sub-problems
+
+Respond in JSON:
+{"subProblems": [{"id": 1, "description": "...", "model": "provider/model", "dependsOn": null, "input": "..."}, ...], "combineStrategy": "sequential|parallel|hierarchical"}`;
+
+export interface RoutedSubProblem {
+  id: number;
+  description: string;
+  model: string;
+  dependsOn: number | null;
+  input: string;
+}
+
+export interface RoutedDecomposition {
+  subProblems: RoutedSubProblem[];
+  combineStrategy: string;
+}
+
+/** Decompose a problem and route each sub-problem to the best model */
+async function decomposeAndRoute(
+  problem: string,
+  models: string[],
+  modelId: string
+): Promise<RoutedDecomposition | null> {
+  if (models.length <= 1) return null; // No routing needed for single model
+
+  const modelDescriptions = models.map(m => {
+    const resolved = resolveModel(m);
+    const provider = m.split('/')[0];
+    const modelName = m.split('/')[1] || m;
+    // Heuristic model strengths
+    const strengths: Record<string, string[]> = {
+      anthropic: ['complex reasoning', 'code generation', 'long-context analysis'],
+      openai: ['general reasoning', 'math', 'code', 'creative tasks'],
+      google: ['multimodal', 'long context', 'factual knowledge'],
+      groq: ['fast inference', 'simple reasoning', 'classification'],
+      wafer: ['reasoning with thinking', 'Chinese+English', 'code'],
+      deepseek: ['code', 'math', 'reasoning'],
+    };
+    const s = strengths[provider] || ['general purpose'];
+    return `${m}: ${s.join(', ')}`;
+  }).join('\n');
+
+  const prompt = DECOMPOSITION_ROUTER_PROMPT
+    .replace('$$models$$', modelDescriptions)
+    .replace('$$problem$$', problem);
+
+  const response = await callLLM(modelId, prompt, 0.7, 60, 1, 'high');
+  if (!response.content || response.content.startsWith('[error')) return null;
+
+  try {
+    const jsonMatch = response.content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    return {
+      subProblems: (parsed.subProblems || []).map((s: any) => ({
+        id: s.id || 0,
+        description: s.description || '',
+        model: s.model || models[0],
+        dependsOn: s.dependsOn ?? null,
+        input: s.input || '',
+      })),
+      combineStrategy: parsed.combineStrategy || 'sequential',
+    };
+  } catch { return null; }
+}
+
+/** Solve a routed decomposition — each sub-problem goes to its assigned model */
+async function solveRoutedDecomposition(
+  decomposition: RoutedDecomposition,
+  modelId: string,
+  budget: { maxCost?: number; maxTime?: number; startTime: number; costSoFar: number }
+): Promise<{ combinedAnswer: string; subResults: Array<{ model: string; answer: string; cost: number }>; totalCost: number }> {
+  const subResults: Array<{ model: string; answer: string; cost: number }> = [];
+  let totalCost = 0;
+
+  // Build dependency graph
+  const solved = new Map<number, string>();
+  const sorted = [...decomposition.subProblems].sort((a, b) => {
+    if (a.dependsOn === null && b.dependsOn !== null) return -1;
+    if (a.dependsOn !== null && b.dependsOn === null) return 1;
+    return 0;
+  });
+
+  for (const sub of sorted) {
+    if (budget.maxCost && totalCost >= budget.maxCost) break;
+    if (budget.maxTime && (Date.now() - budget.startTime) / 1000 >= budget.maxTime) break;
+
+    // Inject dependency results into input
+    let input = sub.input;
+    if (sub.dependsOn !== null && solved.has(sub.dependsOn)) {
+      input = `Previous sub-problem result: ${solved.get(sub.dependsOn)}\n\nCurrent problem: ${input}`;
+    }
+
+    // Resolve the assigned model — fall back to primary if not available
+    const assignedModel = sub.model;
+    const resolved = resolveModel(assignedModel);
+    const actualModel = (resolved && getApiKey(resolved.provider)) ? assignedModel : modelId;
+
+    const result = await callLLM(actualModel, input, 0.7, 120, 1, 'high');
+    totalCost += result.cost;
+    budget.costSoFar += result.cost;
+
+    const answer = result.content.startsWith('[error') ? `[sub-problem ${sub.id} failed]` : result.content;
+    subResults.push({ model: actualModel, answer, cost: result.cost });
+    solved.set(sub.id, answer);
+  }
+
+  // Combine results
+  const combinePrompt = `Combine the following sub-problem results into a single coherent answer:
+${subResults.map((r, i) => `Sub-problem ${i + 1} (${r.model}): ${r.answer.slice(0, 500)}`).join('\n')}`;
+  const combineResult = await callLLM(modelId, combinePrompt, 0.5, 60, 0, 'medium');
+  totalCost += combineResult.cost;
+
+  return {
+    combinedAnswer: combineResult.content,
+    subResults,
+    totalCost,
+  };
+}
+
+// ===========================================================================
+// Layer 19: Per-Iteration Prompt Adaptation — evolve prompt mid-solve
+// ============================================================================
+
+const ITERATION_ADAPTATION_PROMPT = `You are a meta-reasoning expert. A solver has attempted a problem and failed. Analyze the failure pattern and suggest a PROMPT MODIFICATION (not a solution) that would help the solver on the next iteration.
+
+Current solver prompt (first 500 chars):
+$$currentPrompt$$
+
+Iteration history (last 3 attempts):
+$$history$$
+
+Problem category: $$category$$
+
+Suggest a specific modification to the solver prompt that addresses the failure pattern. The modification should be:
+1. A short insertion (1-3 sentences) to add before the problem
+2. A specific anti-pattern to warn against
+3. OR a replacement for a section of the prompt
+
+Respond in JSON:
+{"type": "pre-insert|anti-pattern|section-replace", "content": "...", "section": "..." (if section-replace), "rationale": "..."}`;
+
+export interface IterationAdaptation {
+  type: 'pre-insert' | 'anti-pattern' | 'section-replace';
+  content: string;
+  section?: string;
+  rationale: string;
+}
+
+/** Adapt the solver prompt based on iteration trajectory */
+async function adaptPromptMidSolve(
+  currentPrompt: string,
+  iterationHistory: Array<{ score: number; feedback: string; iteration: number }>,
+  category: string,
+  modelId: string
+): Promise<IterationAdaptation | null> {
+  // Only adapt if we have failures and a clear pattern
+  if (iterationHistory.length < 2) return null;
+  const recentFailures = iterationHistory.filter(h => h.score < 0.5).slice(-3);
+  if (recentFailures.length < 2) return null; // Not enough failures to learn from
+
+  const historyStr = recentFailures.map(h =>
+    `Iter ${h.iteration}: score=${h.score.toFixed(2)}, feedback: ${h.feedback.slice(0, 200)}`
+  ).join('\n');
+
+  const prompt = ITERATION_ADAPTATION_PROMPT
+    .replace('$$currentPrompt$$', currentPrompt.slice(0, 500))
+    .replace('$$history$$', historyStr)
+    .replace('$$category$$', category);
+
+  const response = await callLLM(modelId, prompt, 0.7, 30, 0, 'high');
+  if (!response.content || response.content.startsWith('[error')) return null;
+
+  try {
+    const jsonMatch = response.content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!parsed.type || !parsed.content) return null;
+    return {
+      type: parsed.type,
+      content: parsed.content,
+      section: parsed.section,
+      rationale: parsed.rationale || '',
+    };
+  } catch { return null; }
+}
+
+/** Apply an iteration adaptation to a solver prompt */
+export function applyIterationAdaptation(prompt: string, adaptation: IterationAdaptation): string {
+  switch (adaptation.type) {
+    case 'pre-insert':
+      // Insert before $$problem$$ (use function replacer to avoid $$ escaping)
+      return prompt.replace('$$problem$$', () => `${adaptation.content}\n\n$$problem$$`);
+    case 'anti-pattern':
+      // Add anti-pattern warning after the problem
+      return prompt.replace('$$problem$$', () => `$$problem$$\n\n⚠️ Anti-pattern to avoid: ${adaptation.content}`);
+    case 'section-replace':
+      // Replace a named section (e.g. "Part 2")
+      if (adaptation.section) {
+        const sectionRegex = new RegExp(
+          `(\\*\\*${adaptation.section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\*\\*[^*]*)(\\*\\*Part)`,
+          's'
+        );
+        const match = prompt.match(sectionRegex);
+        if (match) {
+          return prompt.replace(match[1], `**${adaptation.section}**\n${adaptation.content}`);
+        }
+      }
+      // Fallback: add as post-insert
+      return prompt.replace('$$problem$$', () => `$$problem$$\n\n${adaptation.content}`);
+    default:
+      return prompt;
+  }
+}
+
+// ===========================================================================
+// Layer 20: ARC-AGI Benchmark Integration — validation against real benchmarks
+// ============================================================================
+
+export interface ArcChallenge {
+  id: string;
+  trainInputs: number[][][];
+  trainOutputs: number[][][];
+  testInputs: number[][][];
+  testOutputs?: number[][][]; // Available for training set, not evaluation
+}
+
+/** Load ARC-AGI challenges from a JSON file */
+function loadArcChallenges(filePath: string): ArcChallenge[] {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    const data = JSON.parse(raw);
+    const challenges: ArcChallenge[] = [];
+
+    for (const [id, challenge] of Object.entries(data as Record<string, any>)) {
+      const trainIn: number[][][] = (challenge.train || []).map((t: any) => t.input);
+      const trainOut: number[][][] = (challenge.train || []).map((t: any) => t.output);
+      const testIn: number[][][] = (challenge.test || []).map((t: any) => t.input);
+      const testOut: number[][][] | undefined = (challenge.test || []).every((t: any) => t.output !== undefined)
+        ? (challenge.test || []).map((t: any) => t.output)
+        : undefined;
+
+      challenges.push({
+        id,
+        trainInputs: trainIn,
+        trainOutputs: trainOut,
+        testInputs: testIn,
+        testOutputs: testOut,
+      });
+    }
+
+    return challenges;
+  } catch (e) {
+    serverLog(`arc-agi: failed to load ${filePath}: ${e instanceof Error ? e.message : String(e)}`);
+    return [];
+  }
+}
+
+/** Run the harness on a batch of ARC-AGI challenges and compute metrics */
+async function runArcBenchmark(
+  challenges: ArcChallenge[],
+  modelId: string,
+  maxChallenges: number = 10,
+  maxCostPerChallenge: number = 0.15,
+  maxTimePerChallenge: number = 120
+): Promise<{
+  total: number;
+  solved: number;
+  partialSolved: number;
+  avgBestScore: number;
+  totalCost: number;
+  totalTime: number;
+  results: Array<{ id: string; passed: boolean; bestScore: number; cost: number; time: number }>;
+}> {
+  const results: Array<{ id: string; passed: boolean; bestScore: number; cost: number; time: number }> = [];
+  const batch = challenges.slice(0, maxChallenges);
+  let totalCost = 0;
+  let totalTime = 0;
+  let solved = 0;
+  let partialSolved = 0;
+  let totalBestScore = 0;
+
+  // Initialize a temporary session for benchmarking
+  const tempSession = createSession('arc-benchmark');
+  tempSession.taskConfig = {
+    name: 'arc-benchmark',
+    type: 'code-reasoning',
+    experts: [],
+    numExperts: 2,
+    models: [modelId],
+    verification: 'sandbox',
+    verifyCommand: undefined,
+    maxCostPerProblem: maxCostPerChallenge,
+    maxTimePerProblem: maxTimePerChallenge,
+  };
+
+  for (const challenge of batch) {
+    const challengeStart = Date.now();
+    let challengeCost = 0;
+
+    // Reset session for each challenge
+    tempSession.iterations = [];
+    tempSession.solutions = [];
+    tempSession.bestResult = null;
+    tempSession.totalPromptTokens = 0;
+    tempSession.totalCompletionTokens = 0;
+    tempSession.totalCost = 0;
+    tempSession.status = 'solving';
+
+    // Build expert configs
+    const expertConfigs = generateExpertConfigs(tempSession.taskConfig, tempSession.strategyAdaptations);
+
+    // Run each expert
+    let allIters: IterationResult[] = [];
+    const budget = {
+      maxCost: maxCostPerChallenge,
+      maxTime: maxTimePerChallenge,
+      startTime: challengeStart,
+      costSoFar: 0,
+    };
+
+    for (let e = 0; e < expertConfigs.length; e++) {
+      const iters = await solveWithExpert(
+        tempSession, expertConfigs[e], e,
+        '', // No text problem, grid data only
+        challenge.trainInputs, challenge.trainOutputs, challenge.testInputs,
+        'sandbox', undefined, budget
+      );
+      allIters.push(...iters);
+    }
+
+    // Evaluate against test outputs if available
+    let passed = allIters.some(r => r.passed);
+    if (passed && challenge.testOutputs) {
+      // Re-verify: check if test output matches
+      const best = allIters.filter(r => r.passed).sort((a, b) => a.iteration - b.iteration)[0];
+      if (best?.code) {
+        let testPass = true;
+        for (let t = 0; t < challenge.testInputs.length; t++) {
+          const testResult = await runInSandbox(best.code, challenge.testInputs[t], 10);
+          if (!testResult.ok) { testPass = false; break; }
+          if (challenge.testOutputs && t < challenge.testOutputs.length) {
+            if (!compareOutputs(testResult.output, challenge.testOutputs[t])) { testPass = false; break; }
+          }
+        }
+        if (!testPass) passed = false;
+      }
+    }
+
+    const bestScore = allIters.length > 0
+      ? Math.max(...allIters.map(r => r.score))
+      : 0;
+    const challengeTime = (Date.now() - challengeStart) / 1000;
+    challengeCost = tempSession.totalCost;
+
+    if (passed) solved++;
+    if (bestScore > 0.5) partialSolved++;
+    totalBestScore += bestScore;
+    totalCost += challengeCost;
+    totalTime += challengeTime;
+
+    results.push({
+      id: challenge.id,
+      passed,
+      bestScore,
+      cost: challengeCost,
+      time: challengeTime,
+    });
+
+    serverLog(`arc-agi: challenge ${challenge.id} ${passed ? '✅' : '❌'} score=${bestScore.toFixed(2)} cost=$${challengeCost.toFixed(4)} time=${challengeTime.toFixed(1)}s`);
+  }
+
+  return {
+    total: batch.length,
+    solved,
+    partialSolved,
+    avgBestScore: totalBestScore / Math.max(batch.length, 1),
+    totalCost,
+    totalTime,
+    results,
+  };
+}
+
+// ===========================================================================
 // Strategy templates — the base prompts the meta-system modifies
 // ============================================================================
 
@@ -3706,6 +4171,33 @@ async function solveWithExpert(
           expertConfig.improvingOrder
         );
         message += '\n\n' + expertConfig.feedbackPrompt.replace('$$feedback$$', feedbackBlock);
+      }
+    }
+
+    // Layer 19: Per-iteration prompt adaptation — after 3 failed iterations, adapt
+    if (solutions.length >= 3 && solutions.slice(-3).every(s => s.score < 0.5)) {
+      const adaptation = await adaptPromptMidSolve(
+        expertConfig.solverPrompt,
+        solutions.slice(-3).map((s, i) => ({
+          score: s.score,
+          feedback: s.feedback,
+          iteration: it - 3 + i,
+        })),
+        session.taskConfig?.type || 'code-reasoning',
+        expertConfig.llmId
+      );
+      if (adaptation) {
+        expertConfig.solverPrompt = applyIterationAdaptation(expertConfig.solverPrompt, adaptation);
+        message = expertConfig.solverPrompt.replace('$$problem$$', formattedProblem);
+        // Re-apply feedback
+        if (solutions.length > 0) {
+          const selected = solutions.filter(() => rng() < expertConfig.selectionProbability);
+          if (selected.length > 0) {
+            const feedbackBlock = buildFeedbackBlock(selected, expertConfig.maxSolutions, expertConfig.improvingOrder);
+            message += '\n\n' + expertConfig.feedbackPrompt.replace('$$feedback$$', feedbackBlock);
+          }
+        }
+        serverLog(`meta-iter-adapt: expert ${expertIndex} iter ${it} — ${adaptation.type}: ${adaptation.rationale.slice(0, 80)}`);
       }
     }
 
@@ -4616,6 +5108,38 @@ async function dispatchAction(
       }
 
       // =================================================================
+      // Layer 17: Meta-harness expert — assign a meta-harness to one expert
+      // =================================================================
+      if (useMeta && metaFeatures && expertConfigs.length > 1) {
+        const mhConfig = selectMetaHarnessExpertConfig(
+          metaFeatures.category, expertConfigs[0], expertConfigs.length
+        );
+        if (mhConfig) {
+          // Replace the last expert's config with the meta-harness config
+          expertConfigs[expertConfigs.length - 1] = mhConfig;
+          serverLog(`meta-meta: assigned meta-harness to expert ${expertConfigs.length - 1}`);
+        }
+      }
+
+      // =================================================================
+      // Layer 18: Multi-model decomposition (when multiple models available)
+      // =================================================================
+      let routedDecomposition: RoutedDecomposition | null = null;
+      if (useMeta && session.taskConfig.models.length > 1 && (problem.length > 20 || trainInputs.length > 0)) {
+        const routeProblem = problem || (trainInputs.length > 0
+          ? `Grid transformation problem with ${trainInputs.length} training examples`
+          : '');
+        if (routeProblem) {
+          routedDecomposition = await decomposeAndRoute(
+            routeProblem, session.taskConfig.models, session.taskConfig.models[0]
+          );
+          if (routedDecomposition) {
+            serverLog(`meta-route: decomposed into ${routedDecomposition.subProblems.length} sub-problems across ${new Set(routedDecomposition.subProblems.map(s => s.model)).size} models`);
+          }
+        }
+      }
+
+      // =================================================================
       // Layer 12: Progressive difficulty — order training examples
       // =================================================================
       const orderedTrainInputs = [...trainInputs];
@@ -4795,6 +5319,21 @@ async function dispatchAction(
           metaFeatures?.category || 'other',
           passed, bestScore, cost, totalDuration
         );
+      }
+
+      // Layer 17: Record meta-harness usage results
+      for (const cfg of expertConfigs) {
+        if ((cfg as any)._metaHarnessId) {
+          recordMetaHarnessUse((cfg as any)._metaHarnessId, passed, bestScore, cost, totalDuration);
+        }
+      }
+
+      // Layer 17: Recursively evolve underperforming meta-harnesses
+      if (useMeta && metaFeatures) {
+        const evolved = await recursiveMetaEvolve(session.taskConfig.models[0]);
+        if (evolved.length > 0) {
+          serverLog(`meta-meta-recursive: evolved ${evolved.length} meta-harness(es)`);
+        }
       }
 
       // Save successful strategies to library
@@ -5404,6 +5943,78 @@ async function dispatchAction(
       text += `Rationale: ${metaH.rationale.slice(0, 200)}\n`;
       text += `Solver prompt (${metaH.solverPrompt.length} chars): ${metaH.solverPrompt.slice(0, 200)}...\n`;
       return { text, details: { metaHarness: metaH } };
+    }
+
+    case 'arc-benchmark': {
+      if (!session.taskConfig) {
+        return { text: '❌ No session initialized. Call init first.', details: {} };
+      }
+      const dataPath = (params.dataPath as string) || '/tmp/poetiq-arc-agi-solver/data/arc-prize-2025/arc-agi_training_challenges.json';
+      const maxChallenges = (params.maxChallenges as number) || 5;
+      const maxCostPerChallenge = (params.maxCostPerChallenge as number) || 0.10;
+      const maxTimePerChallenge = (params.maxTimePerChallenge as number) || 60;
+
+      const challenges = loadArcChallenges(dataPath);
+      if (challenges.length === 0) {
+        return { text: `❌ No ARC-AGI challenges loaded from ${dataPath}. Check file path.`, details: {} };
+      }
+
+      const result = await runArcBenchmark(
+        challenges, session.taskConfig.models[0],
+        maxChallenges, maxCostPerChallenge, maxTimePerChallenge
+      );
+
+      let text = `🧪 ARC-AGI Benchmark Results:\n`;
+      text += `Challenges: ${result.total} | Solved: ${result.solved} (${(result.solved / result.total * 100).toFixed(0)}%) | Partial: ${result.partialSolved}\n`;
+      text += `Avg best score: ${result.avgBestScore.toFixed(2)} | Total cost: $${result.totalCost.toFixed(4)} | Total time: ${result.totalTime.toFixed(1)}s\n\n`;
+      for (const r of result.results) {
+        text += `${r.passed ? '✅' : '❌'} ${r.id}: score=${r.bestScore.toFixed(2)} cost=$${r.cost.toFixed(4)} time=${r.time.toFixed(1)}s\n`;
+      }
+
+      return { text, details: result };
+    }
+
+    case 'route-decompose': {
+      if (!session.taskConfig) {
+        return { text: '❌ No session initialized. Call init first.', details: {} };
+      }
+      const problemText = params.problem as string;
+      if (!problemText) {
+        return { text: '❌ route-decompose requires --problem.', details: {} };
+      }
+
+      const decomposition = await decomposeAndRoute(
+        problemText, session.taskConfig.models, session.taskConfig.models[0]
+      );
+
+      if (!decomposition) {
+        return { text: `❌ Failed to decompose and route. Need multiple models.`, details: {} };
+      }
+
+      let text = `🔀 Multi-Model Decomposition:\n`;
+      text += `Strategy: ${decomposition.combineStrategy}\n`;
+      text += `Sub-problems (${decomposition.subProblems.length}):\n`;
+      for (const sub of decomposition.subProblems) {
+        text += `  #${sub.id}: ${sub.description.slice(0, 80)}\n`;
+        text += `    Model: ${sub.model} | Depends: ${sub.dependsOn ?? 'none'}\n`;
+      }
+
+      // Optionally solve
+      if (params.solve as boolean) {
+        const budget = {
+          maxCost: session.taskConfig.maxCostPerProblem,
+          maxTime: session.taskConfig.maxTimePerProblem,
+          startTime: Date.now(),
+          costSoFar: session.totalCost,
+        };
+        const result = await solveRoutedDecomposition(
+          decomposition, session.taskConfig.models[0], budget
+        );
+        text += `\n🔍 Combined Answer (${result.subResults.length} sub-results, $${result.totalCost.toFixed(4)}):\n`;
+        text += result.combinedAnswer.slice(0, 500);
+      }
+
+      return { text, details: { decomposition } };
     }
 
     default:

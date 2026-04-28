@@ -2,7 +2,7 @@
 
 Recursive self-improving reasoning harness — the proprietary layer rebuilt from first principles.
 
-Builds task-specific reasoning strategies on top of any LLM by running iterative solve-verify-feedback loops with multi-expert ensembling, voting, and a **16-layer meta-system** that discovers, adapts, evolves, transfers, and validates strategies autonomously.
+Builds task-specific reasoning strategies on top of any LLM by running iterative solve-verify-feedback loops with multi-expert ensembling, voting, and a **20-layer meta-system** that discovers, adapts, evolves, transfers, and validates strategies autonomously.
 
 **JS-exclusive** — LLM calls go through pi's native LLM infrastructure (`@mariozechner/pi-ai`). Code sandbox uses Node's `vm` module. Zero Python dependency.
 
@@ -10,7 +10,7 @@ Builds task-specific reasoning strategies on top of any LLM by running iterative
 
 The core insight (from first-principles analysis of SOTA reasoning systems): **LLMs are knowledge stores that require intelligent probing strategies to extract reliable answers.** The harness layer (open-source) iteratively generates, verifies, and refines. The meta-system layer (proprietary, rebuilt here) discovers and evolves the strategies themselves.
 
-### The 16-Layer Meta-System
+### The 20-Layer Meta-System
 
 | Layer | Name | What it does |
 |-------|------|-------------|
@@ -31,6 +31,10 @@ The core insight (from first-principles analysis of SOTA reasoning systems): **L
 | 14 | **Per-Problem Prompt Synthesis** | Generate + validate specialized prompts for novel problem types |
 | 15 | **Meta-Meta Level** | Harness-of-harnesses — generate new approach types from performance data |
 | 16 | **Gradient-Based Budget Optimization** | Trajectory-based improvement estimation with finite-difference gradients |
+| 17 | **Recursive Meta-Meta Nesting** | Meta-harnesses feed back into solve; recursive evolution of underperformers |
+| 18 | **Multi-Model Decomposition** | Route sub-questions to different models in parallel based on strengths |
+| 19 | **Per-Iteration Prompt Adaptation** | Evolve the solver prompt mid-solve based on failure patterns |
+| 20 | **ARC-AGI Benchmark Integration** | Validate against real ARC-AGI-2 challenges with scoring |
 
 ### Layer 6: Recursive Harness Generation — the "solver of solvers"
 
@@ -124,6 +128,42 @@ Replaces simple proportional reallocation with **finite-difference gradient esti
 - Predicts expected next score: current + gradient + 0.5 × acceleration
 - Allocates iterations proportional to (expected improvement × confidence)
 - Detects when an expert should switch approaches: stuck (gradient ≈ 0) + decelerating (acceleration < 0)
+
+### Layer 17: Recursive Meta-Meta Nesting
+
+Meta-harnesses don't just get generated — they **feed back into solve**:
+- `selectMetaHarnessExpertConfig()` assigns the best meta-harness to one expert in the ensemble
+- Meta-harness performance is tracked (useCount, avgScore, successCount)
+- Underperforming meta-harnesses (useCount ≥ 2, avgScore < 0.5, generation < 3) are **recursively evolved** via `recursiveMetaEvolve()`
+- This creates a true recursive loop: solve → generate meta-harness → use in solve → evolve if underperforming → repeat
+
+### Layer 18: Multi-Model Decomposition
+
+When multiple models are available, the system **routes sub-questions to the best-suited model**:
+- `decomposeAndRoute()`: LLM analyzes the problem and assigns sub-problems to models based on heuristic strengths
+- Model strength heuristics: Anthropic (complex reasoning, code), OpenAI (math, creative), Google (multimodal), Groq (fast), Wafer (reasoning), DeepSeek (code, math)
+- Dependency tracking: sub-problems can depend on previous results
+- `solveRoutedDecomposition()`: solves each sub-problem with its assigned model, combines results
+- Triggered automatically in solve when `models.length > 1` and `useMeta=true`
+
+### Layer 19: Per-Iteration Prompt Adaptation
+
+The solver prompt **adapts mid-solve** based on failure patterns:
+- After 3 consecutive failed iterations (score < 0.5), `adaptPromptMidSolve()` is called
+- LLM analyzes the failure trajectory and suggests a prompt modification
+- Three adaptation types: `pre-insert` (add before problem), `anti-pattern` (warn after problem), `section-replace` (replace a named section)
+- `applyIterationAdaptation()` modifies the prompt for subsequent iterations
+- The adaptation persists within the expert's solve loop
+
+### Layer 20: ARC-AGI Benchmark Integration
+
+The system can **validate against real ARC-AGI-2 challenges**:
+- `loadArcChallenges()`: loads challenges from ARC-AGI JSON files
+- `runArcBenchmark()`: runs the harness on a batch of challenges with budget limits
+- Re-verifies test outputs against ground truth (when available)
+- Computes: solved, partial solved, avg best score, total cost, total time
+- CLI: `pi-reason-harness arc-benchmark --data-path ... --max-challenges 5`
+- **Benchmark results with wafer/GLM-5.1**: 5/7 unique challenges solved (71%), 1 near-miss (0.97), cost ~$0.04/challenge
 
 ### Layers 0-5: Core Meta-System
 
@@ -241,6 +281,10 @@ pi-reason-harness model-routes
 │  Layer 14: Per-Problem Prompt Synthesis (novel types)   │
 │  Layer 15: Meta-Meta Level (harness-of-harnesses)        │
 │  Layer 16: Gradient-Based Budget Optimization            │
+│  Layer 17: Recursive Meta-Meta Nesting (harness↔solve)    │
+│  Layer 18: Multi-Model Decomposition (model routing)     │
+│  Layer 19: Per-Iteration Prompt Adaptation (mid-solve)   │
+│  Layer 20: ARC-AGI Benchmark Integration (validation)   │
 └───────────────────────┬─────────────────────────────────┘
                         │ generates (with deltas + rules + specs)
                         ▼
@@ -291,6 +335,8 @@ pi-reason-harness model-routes
 | `synth-prompts` | List synthesized prompts with validation stats |
 | `meta-harnesses` | List meta-harnesses (generated approach types) |
 | `generate-meta-harness` | Generate a new approach type from performance data |
+| `arc-benchmark` | Run ARC-AGI benchmark validation against real challenges |
+| `route-decompose` | Decompose a problem across multiple models |
 
 ### init flags
 
@@ -337,7 +383,7 @@ No additional setup required — if pi can call the model, so can the harness.
 npm test
 ```
 
-90 tests covering: vm sandbox, formatProblem, arrayDiff, buildDetailedFeedback, PromptDelta application, budget bandit (early stopping, re-exploration), Thompson sampling (Beta distribution), meta-rule engine (validation, filtering), prompt quality metrics, harness spec generation, ensemble diversification, budget optimization (marginal ROI), cross-domain transfer, confidence-weighted voting, progressive difficulty, decomposition, problem fingerprinting, synthesized prompts, meta-harnesses, gradient-based budget optimization, approach switching.
+104 tests covering: vm sandbox, formatProblem, arrayDiff, buildDetailedFeedback, PromptDelta application, budget bandit, Thompson sampling, meta-rule engine, prompt quality metrics, harness specs, ensemble diversification, budget optimization, cross-domain transfer, confidence-weighted voting, progressive difficulty, decomposition, problem fingerprinting, synthesized prompts, meta-harnesses, gradient estimation, approach switching, recursive meta-meta nesting, multi-model decomposition routing, per-iteration prompt adaptation, ARC-AGI benchmark.
 
 ## License
 
