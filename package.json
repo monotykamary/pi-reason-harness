@@ -1,0 +1,34 @@
+{
+  "name": "pi-reason-harness",
+  "version": "1.0.0",
+  "description": "Recursive self-improving reasoning harness for pi — iterate, verify, improve. Builds task-specific reasoning strategies on top of any LLM.",
+  "keywords": ["pi-package"],
+  "bin": {
+    "pi-reason-harness": "harness/cli.ts"
+  },
+  "files": ["extensions", "harness", "skills", "README.md", "LICENSE"],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
+  },
+  "dependencies": {
+    "@mariozechner/pi-ai": "*"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.65.0",
+    "@mariozechner/pi-tui": "^0.65.0",
+    "@sinclair/typebox": "*"
+  }
+}
