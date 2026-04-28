@@ -79,8 +79,11 @@ pi-reason-harness model-routes
 | `pi-reason-harness evolve-harness` | Evolve the worst-performing spec |
 | `pi-reason-harness transfer` | Transfer strategy between categories |
 | `pi-reason-harness decompose` | Decompose a problem into sub-problems |
+| `pi-reason-harness synth-prompts` | List synthesized prompts |
+| `pi-reason-harness meta-harnesses` | List meta-harnesses |
+| `pi-reason-harness generate-meta-harness` | Generate new approach type |
 
-## The 13-Layer Meta-System
+## The 16-Layer Meta-System
 
 | Layer | Name | What it does |
 |-------|------|-------------|
@@ -97,6 +100,9 @@ pi-reason-harness model-routes
 | 10 | Cross-Domain Transfer | Transfer strategies across categories |
 | 11 | Confidence-Weighted Voting | Weight votes by quality |
 | 12 | Progressive Difficulty | Easiest examples first |
+| 14 | Per-Problem Prompt Synthesis | Generate + validate prompts for novel types |
+| 15 | Meta-Meta Level | Harness-of-harnesses — new approach types |
+| 16 | Gradient-Based Budget Optimization | Trajectory-based improvement estimation |
 
 ## Approach Types (Ensemble Diversification)
 
@@ -130,6 +136,8 @@ All meta-system data persists at `~/.pi-reason-harness/`:
 | `meta-rules.json` | Cross-strategy principles with validation stats |
 | `model-routes.json` | Per model×category routing stats |
 | `harness-specs.json` | Complete harness specs per category×approach |
+| `synthesized-prompts.json` | Per-problem-type specialized prompts |
+| `meta-harnesses.json` | Generated approach types with evolution |
 
 ## Key Principles
 

@@ -46,18 +46,99 @@ import {
   type SimpleStreamOptions,
 } from '@mariozechner/pi-ai';
 
+// =============================================================================
+// Custom provider registry (for providers not in pi-ai's built-in list)
+// =============================================================================
+
+interface CustomProviderConfig {
+  baseUrl: string;
+  apiKey: string;
+  api: string;
+  models?: Record<string, Partial<Model<any>>>;
+}
+
+const CUSTOM_PROVIDERS: Record<string, CustomProviderConfig> = {
+  wafer: {
+    baseUrl: 'https://pass.wafer.ai/v1',
+    apiKey: 'WAFER_API_KEY',
+    api: 'openai-completions',
+    models: {
+      'GLM-5.1': {
+        reasoning: true,
+        input: ['text'],
+        cost: { input: 1, output: 3, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 202752,
+        maxTokens: 32768,
+      },
+      'Qwen3.5-397B-A17B': {
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: { input: 1, output: 3, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 262144,
+        maxTokens: 32768,
+      },
+    },
+  },
+};
+
+function getCustomProvider(provider: string): CustomProviderConfig | undefined {
+  return CUSTOM_PROVIDERS[provider];
+}
+
+function isCustomProvider(provider: string): boolean {
+  return provider in CUSTOM_PROVIDERS;
+}
+
 /** Resolve a model from provider/id notation (e.g. "anthropic/claude-sonnet-4-5") */
 function resolveModel(modelId: string): Model<any> | null {
   const slashIdx = modelId.indexOf('/');
   if (slashIdx === -1) return null;
   const provider = modelId.slice(0, slashIdx);
   const id = modelId.slice(slashIdx + 1);
-  return getModel(provider as any, id) ?? null;
+  const builtIn = getModel(provider as any, id);
+  if (builtIn) return builtIn;
+  // Fallback: check custom provider registry
+  const custom = getCustomProvider(provider);
+  if (custom) {
+    const modelOverrides = custom.models?.[id] || {};
+    return {
+      id,
+      name: id,
+      api: custom.api as any,
+      provider,
+      reasoning: true,
+      input: ['text'],
+      cost: { input: 1, output: 3, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 32768,
+      ...modelOverrides,
+    } as Model<any>;
+  }
+  // Fallback: create synthetic model for unknown providers with valid API keys
+  const apiKey = getApiKey(provider);
+  if (apiKey) {
+    return {
+      id,
+      name: id,
+      api: 'openai-completions',
+      provider,
+      reasoning: true,
+      input: ['text'],
+      cost: { input: 1, output: 3, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 32768,
+    } as Model<any>;
+  }
+  return null;
 }
 
-/** Get API key for a provider (checks env vars) */
+/** Get API key for a provider (checks env vars + custom provider env vars) */
 function getApiKey(provider: string): string | undefined {
-  return getEnvApiKey(provider as any);
+  const builtIn = getEnvApiKey(provider as any);
+  if (builtIn) return builtIn;
+  // Fallback: check PROVIDER_API_KEY env var (for custom providers like wafer)
+  const envKey = `${provider.toUpperCase()}_API_KEY`;
+  return process.env[envKey];
 }
 
 // =============================================================================
@@ -2416,6 +2497,444 @@ async function autoTransfer(
 }
 
 // ===========================================================================
+// Layer 14: Per-Problem Prompt Synthesis — generate + validate prompts for novel problems
+// ============================================================================
+
+const PROMPT_SYNTHESIZER_PROMPT = `You are a meta-reasoning expert. Given a problem, generate a SPECIALIZED solver prompt that would be more effective than a generic template.
+
+Rules:
+1. The prompt must contain $$problem$$ as the placeholder for the problem text.
+2. Focus on the specific type of reasoning this problem requires.
+3. Include concrete strategies, not vague advice.
+4. Specify the output format clearly (JavaScript function or direct answer).
+5. Keep it concise — under 500 words.
+6. The prompt should be a complete system instruction for an LLM.
+
+Problem category: $$category$$
+Problem preview: $$preview$$
+
+Respond with ONLY the prompt text, no markdown, no explanation.`;
+
+interface SynthesizedPrompt {
+  id: string;
+  category: string;
+  problemFingerprint: string; // hash of problem characteristics
+  solverPrompt: string;
+  feedbackPrompt: string;
+  configOverrides: Record<string, any>;
+  validationScore: number;
+  validationTests: number;
+  validated: boolean;
+  created: number;
+  useCount: number;
+  successCount: number;
+  avgScore: number;
+}
+
+const SYNTHESIZED_PROMPTS_PATH = process.env.PI_REASON_HARNESS_SYNTH_PROMPTS ??
+  join(process.env.HOME || '/tmp', '.pi-reason-harness', 'synthesized-prompts.json');
+let synthesizedPrompts: SynthesizedPrompt[] = [];
+
+function loadSynthesizedPrompts() {
+  try {
+    const raw = fs.readFileSync(SYNTHESIZED_PROMPTS_PATH, 'utf-8');
+    synthesizedPrompts = JSON.parse(raw);
+  } catch { synthesizedPrompts = []; }
+}
+
+function saveSynthesizedPrompts() {
+  try { fs.writeFileSync(SYNTHESIZED_PROMPTS_PATH, JSON.stringify(synthesizedPrompts, null, 2)); } catch {}
+}
+
+/** Compute a fingerprint for a problem — captures structural features, not exact content */
+function problemFingerprint(problem: string, trainInputs: unknown[], trainOutputs: unknown[]): string {
+  const features: string[] = [];
+  // Problem type indicator
+  if (trainInputs.length > 0) {
+    const input = trainInputs[0];
+    if (Array.isArray(input)) {
+      const flat = flatten(input as unknown[]);
+      features.push(`grid:${flat.length}`);
+      features.push(`unique:${new Set(flat).size}`);
+    }
+  }
+  // Problem text features
+  const lower = problem.toLowerCase();
+  if (lower.includes('rotate') || lower.includes('rotation')) features.push('op:rotate');
+  if (lower.includes('scale') || lower.includes('resize')) features.push('op:scale');
+  if (lower.includes('mirror') || lower.includes('flip')) features.push('op:mirror');
+  if (lower.includes('count') || lower.includes('number of')) features.push('op:count');
+  if (lower.includes('fill') || lower.includes('color')) features.push('op:fill');
+  if (lower.includes('move') || lower.includes('shift')) features.push('op:move');
+  if (lower.includes('pattern') || lower.includes('repeat')) features.push('op:pattern');
+  // Size class
+  if (trainInputs.length > 0 && Array.isArray(trainInputs[0])) {
+    const size = flatten(trainInputs[0] as unknown[]).length;
+    features.push(size <= 4 ? 'size:tiny' : size <= 16 ? 'size:small' : size <= 64 ? 'size:medium' : 'size:large');
+  }
+  return features.join('|');
+}
+
+/** Synthesize a specialized prompt for a novel problem via LLM */
+async function synthesizePrompt(
+  category: string,
+  problem: string,
+  trainInputs: unknown[],
+  trainOutputs: unknown[],
+  modelId: string
+): Promise<SynthesizedPrompt | null> {
+  const preview = trainInputs.length > 0
+    ? `First training input: ${JSON.stringify(trainInputs[0]).slice(0, 200)}`
+    : problem.slice(0, 200);
+
+  const prompt = PROMPT_SYNTHESIZER_PROMPT
+    .replace('$$category$$', category)
+    .replace('$$preview$$', preview);
+
+  const response = await callLLM(modelId, prompt, 0.7, 60, 1, 'high');
+  if (!response.content || response.content.startsWith('[error')) return null;
+
+  const solverPrompt = response.content.trim();
+  if (!solverPrompt.includes('$$problem$$')) return null;
+
+  const fingerprint = problemFingerprint(problem, trainInputs, trainOutputs);
+
+  return {
+    id: randomBytes(4).toString('hex'),
+    category,
+    problemFingerprint: fingerprint,
+    solverPrompt,
+    feedbackPrompt: CODE_REASONING_FEEDBACK, // reuse base feedback
+    configOverrides: { temperature: 1.0, maxIterations: 12 },
+    validationScore: 0,
+    validationTests: 0,
+    validated: false,
+    created: Date.now(),
+    useCount: 0,
+    successCount: 0,
+    avgScore: 0,
+  };
+}
+
+/** Find a synthesized prompt matching the problem fingerprint */
+function findSynthesizedPrompt(category: string, fingerprint: string): SynthesizedPrompt | null {
+  loadSynthesizedPrompts();
+  // Exact fingerprint match
+  const exact = synthesizedPrompts.find(
+    p => p.category === category && p.problemFingerprint === fingerprint && p.validated
+  );
+  if (exact) return exact;
+  // Partial match (same category + first 2 fingerprint features)
+  const prefix = fingerprint.split('|').slice(0, 2).join('|');
+  const partial = synthesizedPrompts.find(
+    p => p.category === category && p.problemFingerprint.startsWith(prefix) && p.avgScore > 0.5
+  );
+  return partial || null;
+}
+
+/** Validate a synthesized prompt by testing on a subset of training data */
+async function validateSynthesizedPrompt(
+  synth: SynthesizedPrompt,
+  trainInputs: unknown[],
+  trainOutputs: unknown[],
+  modelId: string,
+  maxTests: number = 2
+): Promise<number> {
+  if (trainInputs.length === 0) return 0;
+  const testCount = Math.min(maxTests, trainInputs.length);
+  let totalScore = 0;
+
+  for (let i = 0; i < testCount; i++) {
+    // Use one training pair as the problem, another to verify
+    const problemText = formatProblem(
+      [trainInputs[i] as number[][]],
+      [trainOutputs[i] as number[][]],
+      [trainInputs[i] as number[][]],
+      false
+    );
+    const solverMsg = synth.solverPrompt.replace('$$problem$$', problemText);
+    const response = await callLLM(modelId, solverMsg, 1.0, 60, 0, 'off');
+    if (response.content.startsWith('[error')) continue;
+
+    const code = parseCodeFromLLM(response.content);
+    if (!code) continue;
+
+    const sandboxResult = await runInSandbox(code, trainInputs[i] as number[][], 10);
+    if (!sandboxResult.ok) continue;
+
+    let score = 0;
+    try {
+      score = computeSoftScore(sandboxResult.output, trainOutputs[i] as number[][]);
+    } catch { continue; }
+    totalScore += score;
+  }
+
+  synth.validationScore = totalScore / testCount;
+  synth.validationTests = testCount;
+  synth.validated = synth.validationScore > 0.5;
+
+  return synth.validationScore;
+}
+
+// ===========================================================================
+// Layer 15: Recursive Meta-Meta Level — harness-of-harnesses
+// ============================================================================
+
+const META_HARNESS_PROMPT = `You are a meta-reasoning architect. Given the performance history of multiple harness specifications, generate a NEW type of harness approach that combines the strengths of successful ones.
+
+Current harness types: code-sandbox, decomposition, chain-of-questions, analogy, counter-factual, exhaustive-search, code-direct
+
+Performance data:
+$$performanceData$$
+
+Propose a NEW approach type that:
+1. Has a clear name and description
+2. Combines insights from successful approaches
+3. Has a specialized solver prompt (with $$problem$$ placeholder)
+4. Has config overrides (temperature, maxIterations, reasoning level)
+5. Explains WHY this approach would outperform existing ones
+
+Respond in JSON:
+{"name": "...", "description": "...", "solverPrompt": "...", "configOverrides": {...}, "rationale": "..."}`;
+
+interface MetaHarness {
+  id: string;
+  name: string;
+  description: string;
+  solverPrompt: string;
+  configOverrides: Record<string, any>;
+  rationale: string;
+  parentId: string | null;
+  generation: number;
+  created: number;
+  useCount: number;
+  successCount: number;
+  avgScore: number;
+}
+
+const META_HARNESSES_PATH = process.env.PI_REASON_HARNESS_META_HARNESSES ??
+  join(process.env.HOME || '/tmp', '.pi-reason-harness', 'meta-harnesses.json');
+let metaHarnesses: MetaHarness[] = [];
+
+function loadMetaHarnesses() {
+  try {
+    const raw = fs.readFileSync(META_HARNESSES_PATH, 'utf-8');
+    metaHarnesses = JSON.parse(raw);
+  } catch { metaHarnesses = []; }
+}
+
+function saveMetaHarnesses() {
+  try { fs.writeFileSync(META_HARNESSES_PATH, JSON.stringify(metaHarnesses, null, 2)); } catch {}
+}
+
+/** Generate a new meta-harness type by analyzing performance of existing specs */
+async function generateMetaHarness(modelId: string): Promise<MetaHarness | null> {
+  loadHarnessSpecs();
+  loadMetaHarnesses();
+
+  // Build performance data from all specs + meta-harnesses
+  const allEntries = [
+    ...harnessSpecs.map(s => ({
+      name: s.approach, category: s.category, score: s.avgScore,
+      win: s.successCount, total: s.useCount, gen: s.generation
+    })),
+    ...metaHarnesses.map(m => ({
+      name: m.name, category: 'meta', score: m.avgScore,
+      win: m.successCount, total: m.useCount, gen: m.generation
+    })),
+  ];
+
+  const performanceData = allEntries
+    .filter(e => e.total > 0)
+    .map(e => `${e.name} (${e.category}): win=${e.win}/${e.total} score=${e.score.toFixed(2)} gen=${e.gen}`)
+    .join('\n');
+
+  if (!performanceData) return null;
+
+  const prompt = META_HARNESS_PROMPT.replace('$$performanceData$$', performanceData);
+  const response = await callLLM(modelId, prompt, 0.8, 60, 1, 'high');
+  if (!response.content || response.content.startsWith('[error')) return null;
+
+  // Parse JSON from response
+  const jsonMatch = response.content.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return null;
+
+  try {
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!parsed.name || !parsed.solverPrompt || !parsed.solverPrompt.includes('$$problem$$')) return null;
+
+    const metaHarness: MetaHarness = {
+      id: randomBytes(4).toString('hex'),
+      name: parsed.name,
+      description: parsed.description || '',
+      solverPrompt: parsed.solverPrompt,
+      configOverrides: parsed.configOverrides || { temperature: 1.0 },
+      rationale: parsed.rationale || '',
+      parentId: null,
+      generation: 1,
+      created: Date.now(),
+      useCount: 0,
+      successCount: 0,
+      avgScore: 0,
+    };
+
+    metaHarnesses.push(metaHarness);
+    saveMetaHarnesses();
+    return metaHarness;
+  } catch { return null; }
+}
+
+/** Evolve a meta-harness by analyzing its failures */
+async function evolveMetaHarness(harnessId: string, modelId: string): Promise<MetaHarness | null> {
+  loadMetaHarnesses();
+  const parent = metaHarnesses.find(m => m.id === harnessId);
+  if (!parent) return null;
+
+  const evolverPrompt = `You are a meta-reasoning architect. Improve the following harness approach based on its performance.
+
+Current approach: ${parent.name}
+Description: ${parent.description}
+Win rate: ${parent.useCount > 0 ? (parent.successCount / parent.useCount * 100).toFixed(0) : 0}%
+Avg score: ${parent.avgScore.toFixed(2)}
+Rationale: ${parent.rationale}
+
+Solver prompt:
+${parent.solverPrompt}
+
+Propose an improved version. Respond in JSON:
+{"name": "...", "description": "...", "solverPrompt": "...", "configOverrides": {...}, "rationale": "..."}`;
+
+  const response = await callLLM(modelId, evolverPrompt, 0.8, 60, 1, 'high');
+  if (!response.content || response.content.startsWith('[error')) return null;
+
+  const jsonMatch = response.content.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return null;
+
+  try {
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!parsed.name || !parsed.solverPrompt) return null;
+
+    const child: MetaHarness = {
+      id: randomBytes(4).toString('hex'),
+      name: parsed.name,
+      description: parsed.description || parent.description,
+      solverPrompt: parsed.solverPrompt,
+      configOverrides: parsed.configOverrides || parent.configOverrides,
+      rationale: parsed.rationale || '',
+      parentId: parent.id,
+      generation: parent.generation + 1,
+      created: Date.now(),
+      useCount: 0,
+      successCount: 0,
+      avgScore: 0,
+    };
+
+    metaHarnesses.push(child);
+    saveMetaHarnesses();
+    return child;
+  } catch { return null; }
+}
+
+// ===========================================================================
+// Layer 16: Gradient-Based Budget Optimization — trajectory-based improvement estimation
+// ============================================================================
+
+interface ExpertTrajectory {
+  expertId: number;
+  history: Array<{ score: number; iteration: number; cost: number; timestamp: number }>;
+}
+
+/** Estimate the gradient of improvement using finite differences on recent history */
+function estimateImprovementGradient(trajectory: ExpertTrajectory): {
+  gradient: number;     // dScore/dIteration
+  acceleration: number; // d²Score/dIteration²
+  expectedNextScore: number;
+  confidence: number;   // 0-1, based on data points
+} {
+  const h = trajectory.history;
+  if (h.length < 2) return { gradient: 0, acceleration: 0, expectedNextScore: 0, confidence: 0 };
+
+  // Use last 5 points for gradient estimation
+  const window = Math.min(5, h.length);
+  const recent = h.slice(-window);
+
+  // First derivative: dScore/dIteration (finite difference)
+  let gradientSum = 0;
+  let gradientCount = 0;
+  for (let i = 1; i < recent.length; i++) {
+    const ds = recent[i].score - recent[i - 1].score;
+    const di = recent[i].iteration - recent[i - 1].iteration;
+    if (di > 0) {
+      gradientSum += ds / di;
+      gradientCount++;
+    }
+  }
+  const gradient = gradientCount > 0 ? gradientSum / gradientCount : 0;
+
+  // Second derivative: acceleration (change in gradient)
+  let accelSum = 0;
+  let accelCount = 0;
+  const gradients: number[] = [];
+  for (let i = 1; i < recent.length; i++) {
+    const ds = recent[i].score - recent[i - 1].score;
+    gradients.push(ds);
+  }
+  for (let i = 1; i < gradients.length; i++) {
+    accelSum += gradients[i] - gradients[i - 1];
+    accelCount++;
+  }
+  const acceleration = accelCount > 0 ? accelSum / accelCount : 0;
+
+  // Expected next score: current + gradient + 0.5 * acceleration
+  const currentScore = h[h.length - 1].score;
+  const expectedNextScore = Math.max(0, Math.min(1,
+    currentScore + gradient + 0.5 * acceleration
+  ));
+
+  // Confidence: more data points = higher confidence
+  const confidence = Math.min(1, recent.length / 5);
+
+  return { gradient, acceleration, expectedNextScore, confidence };
+}
+
+/** Allocate iterations based on gradient-estimated improvement potential */
+function gradientBudgetAllocation(
+  trajectories: ExpertTrajectory[],
+  totalRemainingIterations: number
+): Map<number, number> {
+  const allocation = new Map<number, number>();
+  if (trajectories.length === 0) return allocation;
+
+  const estimates = trajectories.map(t => ({
+    expertId: t.expertId,
+    ...estimateImprovementGradient(t),
+  }));
+
+  // Weight by expected improvement × confidence
+  const weights = estimates.map(e => {
+    const improvement = Math.max(0, e.expectedNextScore - (trajectories.find(t => t.expertId === e.expertId)?.history.slice(-1)[0]?.score || 0));
+    return improvement * e.confidence + 0.01; // small baseline
+  });
+
+  const totalWeight = weights.reduce((s, w) => s + w, 0);
+
+  for (const [i, e] of estimates.entries()) {
+    const proportion = weights[i] / totalWeight;
+    const iters = Math.max(1, Math.round(proportion * totalRemainingIterations));
+    allocation.set(e.expertId, iters);
+  }
+
+  return allocation;
+}
+
+/** Should we switch approaches for an expert? (gradient is negative and stuck) */
+function shouldSwitchApproach(trajectory: ExpertTrajectory): boolean {
+  const { gradient, acceleration, confidence } = estimateImprovementGradient(trajectory);
+  // Switch if: stuck (gradient ≈ 0), decelerating (acceleration < 0), and confident
+  return confidence > 0.6 && gradient < 0.01 && acceleration < -0.01;
+}
+
+// ===========================================================================
 // Strategy templates — the base prompts the meta-system modifies
 // ============================================================================
 
@@ -2862,6 +3381,65 @@ async function callLLM(
   const t0 = Date.now();
 
   try {
+    // For custom providers not in pi-ai's registry, use direct OpenAI-compatible API calls
+    if (isCustomProvider(model.provider)) {
+      const customProvider = getCustomProvider(model.provider)!;
+      const resolvedApiKey = process.env[customProvider.apiKey] || apiKey;
+      const baseUrl = customProvider.baseUrl;
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${resolvedApiKey}`,
+        },
+        body: JSON.stringify({
+          model: model.id,
+          messages: [{ role: 'user', content: message }],
+          temperature,
+          max_tokens: model.maxTokens || 32768,
+          stream: false,
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        return {
+          content: `[error: ${response.status} ${response.statusText}: ${errText.slice(0, 500)}]`,
+          promptTokens: 0,
+          completionTokens: 0,
+          durationMs: Date.now() - t0,
+          cost: 0,
+        };
+      }
+
+      const data = await response.json() as any;
+      const choice = data.choices?.[0]?.message;
+      // Handle reasoning models: content may be null, reasoning_content has thinking
+      // but the actual answer is in content (may be null if all tokens went to reasoning)
+      let content = choice?.content || '';
+      // If content is empty but reasoning_content exists, include it as context
+      const reasoningContent = choice?.reasoning_content || '';
+      if (!content && reasoningContent) {
+        content = `[Note: model used all tokens for reasoning, no output produced. Try again with more tokens.]`;
+      }
+      const usage = data.usage;
+      const promptTokens = usage?.prompt_tokens || 0;
+      const completionTokens = usage?.completion_tokens || 0;
+
+      const inputCost = (model.cost.input / 1_000_000) * promptTokens;
+      const outputCost = (model.cost.output / 1_000_000) * completionTokens;
+      const cost = inputCost + outputCost;
+
+      return {
+        content,
+        promptTokens,
+        completionTokens,
+        durationMs: Date.now() - t0,
+        cost,
+      };
+    }
+
+    // Built-in providers: use pi-ai's completeSimple
     const assistantMsg = await completeSimple(model, context, options);
     const usage = assistantMsg.usage;
     const textParts = assistantMsg.content
@@ -3931,6 +4509,45 @@ async function dispatchAction(
             serverLog(`meta: Thompson sampling routed to ${routed} for category=${metaFeatures.category}`);
           }
         }
+
+        // Layer 14: Per-problem prompt synthesis for novel problems
+        const fingerprint = problemFingerprint(analyzeText, trainInputs, trainOutputs);
+        const existingSynth = findSynthesizedPrompt(metaFeatures.category, fingerprint);
+        if (existingSynth && existingSynth.validated && existingSynth.avgScore > 0.5) {
+          // Use the validated synthesized prompt instead of generic template
+          metaFeatures.promptDelta.preProblemInsert =
+            (metaFeatures.promptDelta.preProblemInsert || '') +
+            `\n[Specialized approach for this problem type: ${existingSynth.problemFingerprint}]`;
+          serverLog(`meta-synth: using synthesized prompt ${existingSynth.id} (fingerprint=${fingerprint}, score=${existingSynth.avgScore.toFixed(2)})`);
+        } else if (!bestStrategy || bestStrategy.avgScore < 0.5) {
+          // No proven strategy or synthesized prompt — synthesize a new one
+          const newSynth = await synthesizePrompt(
+            metaFeatures.category, analyzeText, trainInputs, trainOutputs,
+            session.taskConfig.models[0]
+          );
+          if (newSynth) {
+            // Validate the synthesized prompt
+            const valScore = await validateSynthesizedPrompt(
+              newSynth, trainInputs as number[][][], trainOutputs as number[][][],
+              session.taskConfig.models[0]
+            );
+            serverLog(`meta-synth: synthesized prompt ${newSynth.id} (valScore=${valScore.toFixed(2)})`);
+            if (newSynth.validated) {
+              loadSynthesizedPrompts();
+              synthesizedPrompts.push(newSynth);
+              saveSynthesizedPrompts();
+            }
+          }
+        }
+
+        // Layer 15: Meta-meta level — check for meta-harnesses
+        loadMetaHarnesses();
+        const bestMetaHarness = metaHarnesses
+          .filter(m => m.useCount > 0 && m.avgScore > 0.5)
+          .sort((a, b) => b.avgScore - a.avgScore)[0];
+        if (bestMetaHarness) {
+          serverLog(`meta-meta: best meta-harness ${bestMetaHarness.name} (score=${bestMetaHarness.avgScore.toFixed(2)}, gen=${bestMetaHarness.generation})`);
+        }
       }
 
       // =================================================================
@@ -4064,7 +4681,7 @@ async function dispatchAction(
 
         // Phase 2: Continue only promising experts, with budget reallocation
         if (continueExperts.length > 0) {
-          // Layer 9: Reallocate budget based on marginal ROI
+          // Layer 9+16: Reallocate budget based on gradient-estimated improvement
           for (const i of continueExperts) {
             const results = phase1Results[i];
             const costHistory = results.map(r => ({
@@ -4077,7 +4694,26 @@ async function dispatchAction(
 
           const totalRemaining = expertConfigs.reduce((s, c) => s + c.maxIterations, 0)
             - phase1Results.reduce((s, r) => s + r.length, 0);
-          const reallocation = reallocateBudget(expertCostHistories, totalRemaining, maxCost ?? Infinity);
+
+          // Layer 16: Use gradient-based allocation if we have enough data
+          let reallocation: Map<number, number>;
+          if (useMeta && phase1Results[0]?.length >= 3) {
+            const trajectories: ExpertTrajectory[] = continueExperts.map(i => ({
+              expertId: i,
+              history: (phase1Results[i] || []).map(r => ({
+                score: r.score, iteration: r.iteration, cost: 0, timestamp: Date.now()
+              })),
+            }));
+            reallocation = gradientBudgetAllocation(trajectories, totalRemaining);
+            // Layer 16: Check if any expert should switch approach
+            for (const t of trajectories) {
+              if (shouldSwitchApproach(t)) {
+                serverLog(`meta-gradient: expert ${t.expertId} should switch approach (stuck, negative acceleration)`);
+              }
+            }
+          } else {
+            reallocation = reallocateBudget(expertCostHistories, totalRemaining, maxCost ?? Infinity);
+          }
 
           const phase2Promises = continueExperts.map(async (expertIdx) => {
             const remainingIters = reallocation.get(expertIdx) ??
@@ -4725,6 +5361,49 @@ async function dispatchAction(
       text += `\nCombine: ${decomposition.combinePrompt.slice(0, 200)}`;
 
       return { text, details: { decomposition } };
+    }
+
+    case 'synth-prompts': {
+      loadSynthesizedPrompts();
+      if (synthesizedPrompts.length === 0) {
+        return { text: '🧪 No synthesized prompts yet. Solve novel problems with meta=true to generate them.', details: {} };
+      }
+      let text = `🧪 Synthesized Prompts (${synthesizedPrompts.length}):\n`;
+      for (const sp of synthesizedPrompts) {
+        const val = sp.validated ? '✅' : '❌';
+        text += `${val} [${sp.id}] cat=${sp.category} fp=${sp.problemFingerprint} val=${sp.validationScore.toFixed(2)} (${sp.validationTests} tests) uses=${sp.useCount} score=${sp.avgScore.toFixed(2)}\n`;
+      }
+      return { text, details: { synthesizedPrompts } };
+    }
+
+    case 'meta-harnesses': {
+      loadMetaHarnesses();
+      if (metaHarnesses.length === 0) {
+        return { text: '🏗️ No meta-harnesses yet. Use generate-meta-harness to create one.', details: {} };
+      }
+      let text = `🏗️ Meta-Harnesses (${metaHarnesses.length}):\n`;
+      for (const mh of metaHarnesses) {
+        text += `${mh.id}: ${mh.name} gen=${mh.generation} uses=${mh.useCount} score=${mh.avgScore.toFixed(2)} parent=${mh.parentId || 'none'}\n`;
+        text += `  ${mh.description.slice(0, 100)}\n`;
+      }
+      return { text, details: { metaHarnesses } };
+    }
+
+    case 'generate-meta-harness': {
+      if (!session.taskConfig) {
+        return { text: '❌ No session initialized. Call init first.', details: {} };
+      }
+      const metaH = await generateMetaHarness(session.taskConfig.models[0]);
+      if (!metaH) {
+        return { text: '❌ Failed to generate meta-harness. Not enough performance data.', details: {} };
+      }
+      let text = `🏗️ New Meta-Harness Generated:\n`;
+      text += `Name: ${metaH.name}\n`;
+      text += `Generation: ${metaH.generation}\n`;
+      text += `Description: ${metaH.description.slice(0, 200)}\n`;
+      text += `Rationale: ${metaH.rationale.slice(0, 200)}\n`;
+      text += `Solver prompt (${metaH.solverPrompt.length} chars): ${metaH.solverPrompt.slice(0, 200)}...\n`;
+      return { text, details: { metaHarness: metaH } };
     }
 
     default:

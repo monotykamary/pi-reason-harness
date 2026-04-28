@@ -2,7 +2,7 @@
 
 Recursive self-improving reasoning harness — the proprietary layer rebuilt from first principles.
 
-Builds task-specific reasoning strategies on top of any LLM by running iterative solve-verify-feedback loops with multi-expert ensembling, voting, and a **13-layer meta-system** that discovers, adapts, evolves, transfers, and validates strategies autonomously.
+Builds task-specific reasoning strategies on top of any LLM by running iterative solve-verify-feedback loops with multi-expert ensembling, voting, and a **16-layer meta-system** that discovers, adapts, evolves, transfers, and validates strategies autonomously.
 
 **JS-exclusive** — LLM calls go through pi's native LLM infrastructure (`@mariozechner/pi-ai`). Code sandbox uses Node's `vm` module. Zero Python dependency.
 
@@ -10,7 +10,7 @@ Builds task-specific reasoning strategies on top of any LLM by running iterative
 
 The core insight (from first-principles analysis of SOTA reasoning systems): **LLMs are knowledge stores that require intelligent probing strategies to extract reliable answers.** The harness layer (open-source) iteratively generates, verifies, and refines. The meta-system layer (proprietary, rebuilt here) discovers and evolves the strategies themselves.
 
-### The 13-Layer Meta-System
+### The 16-Layer Meta-System
 
 | Layer | Name | What it does |
 |-------|------|-------------|
@@ -28,6 +28,9 @@ The core insight (from first-principles analysis of SOTA reasoning systems): **L
 | 11 | **Confidence-Weighted Voting** | Weight votes by self-assessed quality, not just output match |
 | 12 | **Progressive Difficulty** | Train on easiest examples first, build up to harder ones |
 | 13 | **Auto-Transfer** | Automatically transfer strategies when new categories are encountered |
+| 14 | **Per-Problem Prompt Synthesis** | Generate + validate specialized prompts for novel problem types |
+| 15 | **Meta-Meta Level** | Harness-of-harnesses — generate new approach types from performance data |
+| 16 | **Gradient-Based Budget Optimization** | Trajectory-based improvement estimation with finite-difference gradients |
 
 ### Layer 6: Recursive Harness Generation — the "solver of solvers"
 
@@ -95,6 +98,33 @@ Training examples are ordered from **easiest to hardest**:
 - The solver sees simpler patterns first, building up to complex ones
 - Mirrors Poetiq's per-iteration shuffle but with intelligence
 
+### Layer 14: Per-Problem Prompt Synthesis
+
+For truly novel problems where no proven strategy exists, the system **synthesizes specialized prompts**:
+- Computes a problem fingerprint based on structural features (grid size, unique values, operation type)
+- If a validated synthesized prompt matches the fingerprint, uses it instead of the generic template
+- If no match, generates a new specialized prompt via LLM and validates it on training data
+- Prompts with validation score > 0.5 are persisted for future use
+- Fingerprint-based matching allows cross-problem generalization
+
+### Layer 15: Meta-Meta Level — Harness-of-Harnesses
+
+The biggest architectural gap with Poetiq: their system doesn't just generate strategies, it generates **new types of harness approaches**. Our meta-meta level:
+- Analyzes performance data across all harness specs and meta-harnesses
+- Uses LLM to propose NEW approach types that combine strengths of successful ones
+- Each meta-harness has a name, description, solver prompt, config overrides, and rationale
+- Meta-harnesses can evolve (generation counter, parent lineage) like strategies
+- Example: "Decomposed-Sandbox-Synthesis" — combines decomposition's cognitive offloading with code-sandbox's deterministic verification
+
+### Layer 16: Gradient-Based Budget Optimization
+
+Replaces simple proportional reallocation with **finite-difference gradient estimation**:
+- Estimates dScore/dIteration (improvement rate) using a 5-point window
+- Estimates d²Score/dIteration² (acceleration/deceleration)
+- Predicts expected next score: current + gradient + 0.5 × acceleration
+- Allocates iterations proportional to (expected improvement × confidence)
+- Detects when an expert should switch approaches: stuck (gradient ≈ 0) + decelerating (acceleration < 0)
+
 ### Layers 0-5: Core Meta-System
 
 These were implemented in the previous iteration and remain the foundation:
@@ -147,6 +177,8 @@ The meta-system persists across server restarts at `~/.pi-reason-harness/`:
 | `meta-rules.json` | Cross-strategy principles with validation stats |
 | `model-routes.json` | Per model×category routing stats |
 | `harness-specs.json` | Complete harness specifications per category×approach |
+| `synthesized-prompts.json` | Per-problem-type specialized prompts with validation |
+| `meta-harnesses.json` | Generated approach types with evolution lineage |
 
 ## Quick Start
 
@@ -190,7 +222,7 @@ pi-reason-harness model-routes
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  META-SYSTEM V3 (13 layers — the proprietary layer)      │
+│  META-SYSTEM V3 (16 layers — the proprietary layer)      │
 │                                                         │
 │  Layer 0: Problem Critic (critique-don't-create)       │
 │  Layer 1: Strategy Library (ROI + quality metrics)      │
@@ -206,6 +238,9 @@ pi-reason-harness model-routes
 │  Layer 11: Confidence-Weighted Voting (quality-ranked)  │
 │  Layer 12: Progressive Difficulty (easiest-first)       │
 │  Layer 13: Auto-Transfer (new category handling)        │
+│  Layer 14: Per-Problem Prompt Synthesis (novel types)   │
+│  Layer 15: Meta-Meta Level (harness-of-harnesses)        │
+│  Layer 16: Gradient-Based Budget Optimization            │
 └───────────────────────┬─────────────────────────────────┘
                         │ generates (with deltas + rules + specs)
                         ▼
@@ -253,6 +288,9 @@ pi-reason-harness model-routes
 | `evolve-harness` | Evolve the worst-performing harness spec |
 | `transfer` | Transfer strategy from one category to another |
 | `decompose` | Decompose a problem into sub-problems |
+| `synth-prompts` | List synthesized prompts with validation stats |
+| `meta-harnesses` | List meta-harnesses (generated approach types) |
+| `generate-meta-harness` | Generate a new approach type from performance data |
 
 ### init flags
 
@@ -278,7 +316,18 @@ The harness uses `@mariozechner/pi-ai` for all LLM calls. Models are specified i
 - `OPENAI_API_KEY` — OpenAI models
 - `GEMINI_API_KEY` — Google models
 - `GROQ_API_KEY` — Groq models
+- `WAFER_API_KEY` — Wafer Pass models (GLM-5.1, Qwen3.5-397B-A17B)
 - etc.
+
+### Custom Providers
+
+The harness also supports custom providers (like Wafer Pass) that aren't in pi-ai's built-in model registry. Custom providers use direct OpenAI-compatible API calls. Currently supported:
+
+| Provider | Base URL | Models | Notes |
+|----------|----------|--------|-------|
+| `wafer` | `https://pass.wafer.ai/v1` | `GLM-5.1`, `Qwen3.5-397B-A17B` | Reasoning models with `reasoning_content` field |
+
+To add a new custom provider, add it to the `CUSTOM_PROVIDERS` map in `server.ts`.
 
 No additional setup required — if pi can call the model, so can the harness.
 
@@ -288,7 +337,7 @@ No additional setup required — if pi can call the model, so can the harness.
 npm test
 ```
 
-83 tests covering: vm sandbox, formatProblem, arrayDiff, buildDetailedFeedback, PromptDelta application, budget bandit (early stopping, re-exploration), Thompson sampling (Beta distribution), meta-rule engine (validation, filtering), prompt quality metrics, harness spec generation, ensemble diversification, budget optimization (marginal ROI), cross-domain transfer, confidence-weighted voting, progressive difficulty, decomposition.
+90 tests covering: vm sandbox, formatProblem, arrayDiff, buildDetailedFeedback, PromptDelta application, budget bandit (early stopping, re-exploration), Thompson sampling (Beta distribution), meta-rule engine (validation, filtering), prompt quality metrics, harness spec generation, ensemble diversification, budget optimization (marginal ROI), cross-domain transfer, confidence-weighted voting, progressive difficulty, decomposition, problem fingerprinting, synthesized prompts, meta-harnesses, gradient-based budget optimization, approach switching.
 
 ## License
 

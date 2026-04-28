@@ -441,6 +441,21 @@ Environment:
       break;
     }
 
+    case 'synth-prompts': {
+      await postAction(JSON.stringify({ action: 'synth-prompts' }));
+      break;
+    }
+
+    case 'meta-harnesses': {
+      await postAction(JSON.stringify({ action: 'meta-harnesses' }));
+      break;
+    }
+
+    case 'generate-meta-harness': {
+      await postAction(JSON.stringify({ action: 'generate-meta-harness' }));
+      break;
+    }
+
     case 'clear': {
       await postAction(JSON.stringify({ action: 'clear' }));
       break;

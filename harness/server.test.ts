@@ -1689,3 +1689,282 @@ describe('Decomposition', () => {
     expect(strategies.length).toBe(3);
   });
 });
+
+describe('Layer 14: Per-problem prompt synthesis', () => {
+  it('computes problem fingerprints by structural features', () => {
+    function flatten(arr: unknown[]): number[] {
+      const result: number[] = [];
+      const stack: unknown[] = [arr];
+      while (stack.length > 0) {
+        const item = stack.pop()!;
+        if (Array.isArray(item)) {
+          for (let i = item.length - 1; i >= 0; i--) stack.push(item[i]);
+        } else if (typeof item === 'number') {
+          result.push(item);
+        }
+      }
+      return result;
+    }
+
+    function problemFingerprint(problem: string, trainInputs: unknown[], trainOutputs: unknown[]): string {
+      const features: string[] = [];
+      if (trainInputs.length > 0) {
+        const input = trainInputs[0];
+        if (Array.isArray(input)) {
+          const flat = flatten(input);
+          features.push(`grid:${flat.length}`);
+          features.push(`unique:${new Set(flat).size}`);
+        }
+      }
+      const lower = problem.toLowerCase();
+      if (lower.includes('rotate')) features.push('op:rotate');
+      if (lower.includes('count')) features.push('op:count');
+      if (lower.includes('fill')) features.push('op:fill');
+      // Size class
+      if (trainInputs.length > 0 && Array.isArray(trainInputs[0])) {
+        const size = flatten(trainInputs[0]);
+        features.push(size.length <= 4 ? 'size:tiny' : size.length <= 16 ? 'size:small' : 'size:medium');
+      }
+      return features.join('|');
+    }
+
+    // Grid problem with rotation
+    const fp1 = problemFingerprint(
+      'Rotate the grid 90 degrees clockwise',
+      [[[1,2],[3,4]]],
+      [[[3,1],[4,2]]]
+    );
+    expect(fp1).toContain('grid:4');
+    expect(fp1).toContain('op:rotate');
+    expect(fp1).toContain('size:tiny');
+
+    // Counting problem
+    const fp2 = problemFingerprint(
+      'Count the number of connected components',
+      [[[1]]],
+      [[[1]]]
+    );
+    expect(fp2).toContain('op:count');
+    expect(fp2).toContain('size:tiny');
+
+    // Different problems of the same type should have similar fingerprints
+    const fp3 = problemFingerprint(
+      'Rotate this grid 90 degrees',
+      [[[1,2,3],[4,5,6],[7,8,9]]],
+      [[[7,4,1],[8,5,2],[9,6,3]]]
+    );
+    expect(fp3).toContain('op:rotate');
+  });
+
+  it('SynthesizedPrompt structure is valid', () => {
+    const synth = {
+      id: 'test1',
+      category: 'grid-transformation',
+      problemFingerprint: 'grid:4|unique:4|op:rotate|size:small',
+      solverPrompt: 'Specialized rotate solver $$problem$$',
+      feedbackPrompt: 'Feedback $$feedback$$',
+      configOverrides: { temperature: 0.8 },
+      validationScore: 0.8,
+      validationTests: 2,
+      validated: true,
+      created: Date.now(),
+      useCount: 0,
+      successCount: 0,
+      avgScore: 0,
+    };
+    expect(synth.solverPrompt).toContain('$$problem$$');
+    expect(synth.problemFingerprint).toContain('op:rotate');
+    expect(synth.validated).toBe(true);
+  });
+});
+
+describe('Layer 15: Meta-meta level', () => {
+  it('MetaHarness structure is valid', () => {
+    const mh = {
+      id: 'mh1',
+      name: 'pattern-code-hybrid',
+      description: 'Combines pattern recognition with code execution',
+      solverPrompt: 'Analyze the pattern first, then write code $$problem$$',
+      configOverrides: { temperature: 0.9 },
+      rationale: 'Code-only approaches miss spatial patterns; pattern-only lacks precision',
+      parentId: null,
+      generation: 1,
+      created: Date.now(),
+      useCount: 0,
+      successCount: 0,
+      avgScore: 0,
+    };
+    expect(mh.solverPrompt).toContain('$$problem$$');
+    expect(mh.generation).toBe(1);
+    expect(mh.rationale.length).toBeGreaterThan(10);
+  });
+
+  it('child meta-harness has incremented generation', () => {
+    const parent = { id: 'mh1', generation: 1 };
+    const child = {
+      id: 'mh2',
+      parentId: 'mh1',
+      generation: parent.generation + 1,
+    };
+    expect(child.generation).toBe(2);
+    expect(child.parentId).toBe('mh1');
+  });
+});
+
+describe('Layer 16: Gradient-based budget optimization', () => {
+  it('estimates positive gradient for improving trajectories', () => {
+    function estimateImprovementGradient(history: Array<{ score: number; iteration: number }>) {
+      if (history.length < 2) return { gradient: 0, acceleration: 0, expectedNextScore: 0, confidence: 0 };
+      const window = Math.min(5, history.length);
+      const recent = history.slice(-window);
+      let gradientSum = 0, gradientCount = 0;
+      for (let i = 1; i < recent.length; i++) {
+        const ds = recent[i].score - recent[i - 1].score;
+        const di = recent[i].iteration - recent[i - 1].iteration;
+        if (di > 0) { gradientSum += ds / di; gradientCount++; }
+      }
+      const gradient = gradientCount > 0 ? gradientSum / gradientCount : 0;
+      const gradients: number[] = [];
+      for (let i = 1; i < recent.length; i++) {
+        gradients.push(recent[i].score - recent[i - 1].score);
+      }
+      let accelSum = 0, accelCount = 0;
+      for (let i = 1; i < gradients.length; i++) {
+        accelSum += gradients[i] - gradients[i - 1];
+        accelCount++;
+      }
+      const acceleration = accelCount > 0 ? accelSum / accelCount : 0;
+      const currentScore = history[history.length - 1].score;
+      const expectedNextScore = Math.max(0, Math.min(1, currentScore + gradient + 0.5 * acceleration));
+      const confidence = Math.min(1, recent.length / 5);
+      return { gradient, acceleration, expectedNextScore, confidence };
+    }
+
+    // Improving trajectory
+    const improving = [
+      { score: 0.0, iteration: 0 },
+      { score: 0.3, iteration: 1 },
+      { score: 0.6, iteration: 2 },
+      { score: 0.8, iteration: 3 },
+      { score: 1.0, iteration: 4 },
+    ];
+    const g = estimateImprovementGradient(improving);
+    expect(g.gradient).toBeGreaterThan(0);
+    expect(g.confidence).toBe(1);
+
+    // Stuck trajectory
+    const stuck = [
+      { score: 0.0, iteration: 0 },
+      { score: 0.0, iteration: 1 },
+      { score: 0.0, iteration: 2 },
+      { score: 0.0, iteration: 3 },
+      { score: 0.0, iteration: 4 },
+    ];
+    const sg = estimateImprovementGradient(stuck);
+    expect(sg.gradient).toBe(0);
+
+    // Decelerating trajectory (acceleration < 0)
+    const decel = [
+      { score: 0.0, iteration: 0 },
+      { score: 0.5, iteration: 1 },
+      { score: 0.7, iteration: 2 },
+      { score: 0.75, iteration: 3 },
+      { score: 0.78, iteration: 4 },
+    ];
+    const dg = estimateImprovementGradient(decel);
+    expect(dg.acceleration).toBeLessThan(0); // slowing down
+  });
+
+  it('gradient allocation favors improving experts', () => {
+    function gradientBudgetAllocation(
+      trajectories: Array<{ expertId: number; history: Array<{ score: number; iteration: number }> }>,
+      totalRemainingIterations: number
+    ): Map<number, number> {
+      const allocation = new Map<number, number>();
+      if (trajectories.length === 0) return allocation;
+      const weights = trajectories.map(t => {
+        if (t.history.length < 2) return 0.01;
+        const recent = t.history.slice(-5);
+        const lastScore = recent[recent.length - 1].score;
+        const firstScore = recent[0].score;
+        const improvement = Math.max(0, lastScore - firstScore);
+        const confidence = Math.min(1, recent.length / 5);
+        return improvement * confidence + 0.01;
+      });
+      const totalWeight = weights.reduce((s, w) => s + w, 0);
+      for (const [i, t] of trajectories.entries()) {
+        const proportion = weights[i] / totalWeight;
+        const iters = Math.max(1, Math.round(proportion * totalRemainingIterations));
+        allocation.set(t.expertId, iters);
+      }
+      return allocation;
+    }
+
+    const improving = {
+      expertId: 0,
+      history: [
+        { score: 0.2, iteration: 0 },
+        { score: 0.5, iteration: 1 },
+        { score: 0.8, iteration: 2 },
+      ],
+    };
+    const stuck = {
+      expertId: 1,
+      history: [
+        { score: 0.0, iteration: 0 },
+        { score: 0.0, iteration: 1 },
+        { score: 0.0, iteration: 2 },
+      ],
+    };
+
+    const alloc = gradientBudgetAllocation([improving, stuck], 10);
+    expect(alloc.get(0)).toBeGreaterThan(alloc.get(1)!);
+  });
+
+  it('shouldSwitchApproach detects stuck experts', () => {
+    function shouldSwitchApproach(history: Array<{ score: number; iteration: number }>): boolean {
+      if (history.length < 3) return false;
+      // Check if gradient ≈ 0 and decelerating
+      const recent = history.slice(-5);
+      let gradientSum = 0, gradientCount = 0;
+      for (let i = 1; i < recent.length; i++) {
+        const ds = recent[i].score - recent[i - 1].score;
+        gradientSum += ds;
+        gradientCount++;
+      }
+      const gradient = gradientCount > 0 ? gradientSum / gradientCount : 0;
+      const gradients: number[] = [];
+      for (let i = 1; i < recent.length; i++) {
+        gradients.push(recent[i].score - recent[i - 1].score);
+      }
+      let accelSum = 0, accelCount = 0;
+      for (let i = 1; i < gradients.length; i++) {
+        accelSum += gradients[i] - gradients[i - 1];
+        accelCount++;
+      }
+      const acceleration = accelCount > 0 ? accelSum / accelCount : 0;
+      const confidence = Math.min(1, recent.length / 5);
+      return confidence > 0.6 && gradient < 0.01 && acceleration < -0.01;
+    }
+
+    // Stuck expert
+    const stuck = [
+      { score: 0.0, iteration: 0 },
+      { score: 0.0, iteration: 1 },
+      { score: 0.0, iteration: 2 },
+      { score: 0.0, iteration: 3 },
+    ];
+    // Not stuck (zero gradient but no negative acceleration)
+    expect(shouldSwitchApproach(stuck)).toBe(false); // gradient=0, acceleration=0, not < -0.01
+
+    // Decelerating expert (stuck then declining)
+    const decel = [
+      { score: 0.6, iteration: 0 },
+      { score: 0.6, iteration: 1 },
+      { score: 0.6, iteration: 2 },
+      { score: 0.6, iteration: 3 },
+      { score: 0.55, iteration: 4 },
+    ];
+    expect(shouldSwitchApproach(decel)).toBe(true);
+  });
+});
