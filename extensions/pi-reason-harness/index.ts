@@ -89,15 +89,7 @@ export default function reasonHarnessExtension(pi: ExtensionAPI) {
   const updateWidget = createWidgetUpdater(getRuntime);
   const harnessServer = createHarnessServer();
 
-  // ===========================================================================
-  // Register tools
-  // ===========================================================================
-
   registerTools(pi);
-
-  // ===========================================================================
-  // /reason command
-  // ===========================================================================
 
   pi.registerCommand('reason', {
     description: 'Manage reasoning harness (init, solve, status, learn, clear)',
@@ -152,10 +144,6 @@ export default function reasonHarnessExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ===========================================================================
-  // Keyboard shortcuts
-  // ===========================================================================
-
   pi.registerShortcut('ctrl+shift+r', {
     description: 'Toggle reason harness widget',
     handler: async (ctx) => {
@@ -168,10 +156,6 @@ export default function reasonHarnessExtension(pi: ExtensionAPI) {
       ctx.ui.notify('Reason harness widget updated', 'info');
     },
   });
-
-  // ===========================================================================
-  // Lifecycle
-  // ===========================================================================
 
   pi.on('session_start', async (_event, ctx) => {
     installShellAlias(getCliPath(), getProjectRoot());

@@ -12,10 +12,6 @@ import { applyIterationAdaptation } from './server.js';
 // We test the pure functions by extracting them for testability.
 // In production these live in server.ts; for tests we inline the critical ones.
 
-// =============================================================================
-// Grid utilities
-// =============================================================================
-
 function ensure2D(arr: unknown): number[][] | null {
   if (!Array.isArray(arr)) return null;
   if (arr.length === 0) return [[]];
@@ -53,10 +49,6 @@ function gridToDiagram(grid: number[][]): string {
   return grid.map(row => row.join(' ')).join('\n');
 }
 
-// =============================================================================
-// Soft score computation
-// =============================================================================
-
 function computeSoftScore(actual: string, expected: unknown): number {
   try {
     const actualArr = JSON.parse(actual);
@@ -89,10 +81,6 @@ function computeSoftScore(actual: string, expected: unknown): number {
   }
 }
 
-// =============================================================================
-// Output comparison
-// =============================================================================
-
 function compareOutputs(actual: string, expected: unknown): boolean {
   try {
     const actualParsed = JSON.parse(actual);
@@ -119,18 +107,10 @@ function compareOutputs(actual: string, expected: unknown): boolean {
   }
 }
 
-// =============================================================================
-// Code parsing
-// =============================================================================
-
 function parseCodeFromLLM(response: string): string | null {
   const m = response.match(/```(?:javascript|js|typescript|ts)\s*(.*?)```/s);
   return m ? m[1].trim() : null;
 }
-
-// =============================================================================
-// RNG
-// =============================================================================
 
 function createRNG(seed: number): () => number {
   let s = seed;
@@ -139,10 +119,6 @@ function createRNG(seed: number): () => number {
     return s / 0x7fffffff;
   };
 }
-
-// =============================================================================
-// Model resolution
-// =============================================================================
 
 function formatProblem(
   trainIn: number[][][],
@@ -174,10 +150,6 @@ function formatProblem(
 
   return exampleStr + challengeStr;
 }
-
-// =============================================================================
-// Detailed feedback (Poetiq parity)
-// =============================================================================
 
 interface SolveResult {
   success: boolean;
@@ -266,10 +238,6 @@ function resolveModelId(modelId: string): { provider: string; id: string } | nul
   };
 }
 
-// =============================================================================
-// Feedback building
-// =============================================================================
-
 function buildFeedbackBlock(
   solutions: Array<{ code: string; feedback: string; score: number }>,
   maxExamples: number = 5,
@@ -291,10 +259,6 @@ ${s.score.toFixed(2)}
     )
     .join('\n\n');
 }
-
-// =============================================================================
-// Strategy adaptation learning
-// =============================================================================
 
 interface StrategyAdaptation {
   insight: string;
@@ -400,10 +364,6 @@ function learnFromIterations(
 
   return adaptations;
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 describe('computeSoftScore', () => {
   it('returns 1.0 for perfect match', () => {
@@ -1004,10 +964,6 @@ describe('buildDetailedFeedback (Poetiq parity)', () => {
     expect(feedback).toContain('TypeError');
   });
 });
-
-// =============================================================================
-// Meta-system V2 tests
-// =============================================================================
 
 describe('PromptDelta', () => {
   const { applyPromptDelta } = (() => {

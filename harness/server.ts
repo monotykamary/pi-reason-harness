@@ -32,10 +32,6 @@ import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as vm from 'node:vm';
 
-// =============================================================================
-// Pi-ai LLM access
-// =============================================================================
-
 import {
   getModel,
   getEnvApiKey,
@@ -45,10 +41,6 @@ import {
   type UserMessage,
   type SimpleStreamOptions,
 } from '@mariozechner/pi-ai';
-
-// =============================================================================
-// Custom provider registry (for providers not in pi-ai's built-in list)
-// =============================================================================
 
 interface CustomProviderConfig {
   baseUrl: string;
@@ -140,10 +132,6 @@ function getApiKey(provider: string): string | undefined {
   const envKey = `${provider.toUpperCase()}_API_KEY`;
   return process.env[envKey];
 }
-
-// =============================================================================
-// Types
-// =============================================================================
 
 export interface ExpertConfig {
   /** Prompt template for the solver — use $$problem$$ as placeholder */
@@ -278,46 +266,6 @@ export interface SessionState {
     problemsAttempted: number;
   };
 }
-
-// =============================================================================
-// Meta-system — the proprietary layer, rebuilt from first principles
-//
-// What Poetiq's open-source code shows: a static harness with fixed prompts
-// and hardcoded config. What their blog results prove: a dynamic system that
-// adapts. The gap is THIS code.
-//
-// Five core insights derived from first principles:
-//
-// 1. CRITIQUE, DON'T CREATE — The analyzer should propose TARGETED DELTAS to
-//    proven templates, not write prompts from scratch. Our old analyzer
-//    generated 1-liner prompts that failed. Code review > writing from zero.
-//
-// 2. BUDGET IS A BANDIT — Allocate compute where ROI is highest. Stop experts
-//    that show no progress. Re-explore when stuck. This is how Poetiq hits
-//    "half the cost" — not hard limits, but intelligent allocation.
-//
-// 3. META-RULES COMPOUND — Every strategy improvement extracts a generalizable
-//    PRINCIPLE (e.g., "add worked examples", "lower temp for hard problems").
-//    These principles bias ALL future improvements. The meta-system gets
-//    smarter over time, not just per-category.
-//
-// 4. CROSS-DOMAIN TRANSFER — Grid strategies don't transfer to knowledge
-//    extraction, but the PRINCIPLE does. "Provide concrete examples" works
-//    everywhere. We extract principles from successful strategies and
-//    test them on other categories.
-//
-// 5. AUTO-TRIGGER — The meta-improver runs automatically after every N
-//    problems, on success rate drops, on new categories, and on staleness.
-//    No human in the loop. The system self-improves continuously.
-//
-// Architecture:
-//   Layer 0: Problem Critic — inspects problem, proposes delta to template
-//   Layer 1: Strategy Library — persistent proven strategies with ROI data
-//   Layer 2: Meta-Rule Engine — cross-strategy principles that compound
-//   Layer 3: Budget Bandit — Thompson sampling for compute allocation
-//   Layer 4: Recursive Improvement — evolves strategies, extracts principles
-//   Layer 5: Auto-Trigger — runs improvement automatically
-// =============================================================================
 
 // ---------------------------------------------------------------------------
 // Meta-System Types
@@ -1258,21 +1206,6 @@ async function maybeAutoImprove(
   return { improved: true, reason, childId: child.id };
 }
 
-// ===========================================================================
-// Layer 6: Recursive Harness Generation — the "solver of solvers"
-//
-// Poetiq's open-source code shows ONE harness config with fixed prompts.
-// Their blog results (SOTA on ARC + HLE simultaneously) prove they generate
-// MULTIPLE different harness configurations per problem type.
-//
-// This layer implements HarnessSpec — a complete specification for a solve
-// approach, including: solve strategy, verification method, decomposition,
-// feedback format, iteration pattern, and model preferences.
-//
-// The meta-system generates multiple specs per problem, validates them on
-// held-out data, and evolves the best ones over time.
-// ===========================================================================
-
 // ---------------------------------------------------------------------------
 // HarnessSpec types
 // ---------------------------------------------------------------------------
@@ -1659,16 +1592,6 @@ async function evolveHarnessSpec(
   }
 }
 
-// ===========================================================================
-// Layer 7: Ensemble Diversification — different approach per expert
-//
-// Instead of N experts with the same prompt (just different seeds/models),
-// each expert uses a FUNDAMENTALLY DIFFERENT approach:
-// Expert 1: code-sandbox (the workhorse)
-// Expert 2: decomposition (break into sub-problems)
-// Expert 3: analogy (solve simpler version first)
-// ===========================================================================
-
 const APPROACH_SOLVER_PROMPTS: Record<ApproachType, string> = {
   'code-sandbox': '', // Uses CODE_REASONING_SOLVER (filled at runtime)
   'code-direct': `You are a world-class expert in solving problems by writing JavaScript code. Unlike the sandboxed approach, you will reason about the code's output WITHOUT executing it.
@@ -1886,14 +1809,6 @@ function generateDiverseExpertConfigs(
   return experts;
 }
 
-// ===========================================================================
-// Layer 8: Sub-problem Decomposition
-//
-// For hard problems, decompose into sub-problems and solve each
-// independently. This is how Poetiq handles ARC's hardest puzzles —
-// they don't try to solve the whole thing at once.
-// ===========================================================================
-
 const DECOMPOSER_PROMPT = `You are a meta-reasoning expert. Decompose the following problem into independent sub-problems that can each be solved separately.
 
 ## Problem
@@ -2009,14 +1924,6 @@ async function solveWithDecomposition(
   };
 }
 
-// ===========================================================================
-// Layer 9: Budget Optimization via Marginal ROI
-//
-// Not just "stop when stuck" but "spend more where ROI is highest".
-// For each expert, estimate the expected improvement per additional
-// iteration, and reallocate budget accordingly.
-// ===========================================================================
-
 /** Estimate marginal ROI: expected score improvement per additional iteration */
 function estimateMarginalROI(
   expertHistory: Array<{ score: number; iteration: number; cost: number }>,
@@ -2095,14 +2002,6 @@ function reallocateBudget(
 
   return allocation;
 }
-
-// ===========================================================================
-// Layer 10: Cross-Domain Transfer
-//
-// When a strategy works in one domain, explicitly transfer insights
-// to related domains. This is how Poetiq achieves SOTA on both ARC
-// AND HLE — strategies from one domain inform the other.
-// ===========================================================================
 
 /** Category similarity map — which categories share deep structure */
 const CATEGORY_ANALOGIES: Record<string, string[]> = {
@@ -2214,14 +2113,6 @@ function categoryDescription(category: string): string {
   return descs[category] || 'General problem-solving domain';
 }
 
-// ===========================================================================
-// Layer 11: Confidence-Weighted Voting
-//
-// Weight votes by self-assessed quality (score + iteration count),
-// not just by output match. A solution that scored 0.9 in 1 iteration
-// should count more than one that scored 0.1 in 8 iterations.
-// ===========================================================================
-
 function confidenceWeightedVoting(
   allResults: IterationResult[],
   config: ExpertConfig
@@ -2303,14 +2194,6 @@ function confidenceWeightedVoting(
 
   return ordered;
 }
-
-// ===========================================================================
-// Layer 12: Progressive Difficulty
-//
-// Order training examples from easiest to hardest. The solver sees
-// simpler patterns first, building up to the complex ones. This is
-// how Poetiq's format_problem() uses shuffle — but with intelligence.
-// ===========================================================================
 
 /** Order training examples by difficulty (easiest first) */
 function orderByDifficulty(
@@ -2411,13 +2294,6 @@ ${gridToDiagram(testIn[c])}
   return exampleStr + challengeStr;
 }
 
-// ===========================================================================
-// Layer 13: Auto-Transfer — automatically transfer strategies to new categories
-//
-// When a new category is encountered and no strategies exist for it,
-// automatically transfer the best strategy from an analogous category.
-// ===========================================================================
-
 async function autoTransfer(
   category: string,
   modelId: string
@@ -2495,10 +2371,6 @@ async function autoTransfer(
 
   return { transferred: true, fromCategory: bestSourceCategory, strategyId: transferred.id };
 }
-
-// ===========================================================================
-// Layer 14: Per-Problem Prompt Synthesis — generate + validate prompts for novel problems
-// ============================================================================
 
 const PROMPT_SYNTHESIZER_PROMPT = `You are a meta-reasoning expert. Given a problem, generate a SPECIALIZED solver prompt that would be more effective than a generic template.
 
@@ -2676,10 +2548,6 @@ async function validateSynthesizedPrompt(
   return synth.validationScore;
 }
 
-// ===========================================================================
-// Layer 15: Recursive Meta-Meta Level — harness-of-harnesses
-// ============================================================================
-
 const META_HARNESS_PROMPT = `You are a meta-reasoning architect. Given the performance history of multiple harness specifications, generate a NEW type of harness approach that combines the strengths of successful ones.
 
 Current harness types: code-sandbox, decomposition, chain-of-questions, analogy, counter-factual, exhaustive-search, code-direct
@@ -2835,10 +2703,6 @@ Propose an improved version. Respond in JSON:
   } catch { return null; }
 }
 
-// ===========================================================================
-// Layer 16: Gradient-Based Budget Optimization — trajectory-based improvement estimation
-// ============================================================================
-
 interface ExpertTrajectory {
   expertId: number;
   history: Array<{ score: number; iteration: number; cost: number; timestamp: number }>;
@@ -2934,10 +2798,6 @@ function shouldSwitchApproach(trajectory: ExpertTrajectory): boolean {
   return confidence > 0.6 && gradient < 0.01 && acceleration < -0.01;
 }
 
-// ===========================================================================
-// Layer 17: Recursive Meta-Meta Nesting — meta-harnesses feed back into solve
-// ============================================================================
-
 /** Select the best meta-harness for a category and integrate it as an expert config */
 function selectMetaHarnessExpertConfig(
   category: string,
@@ -2999,10 +2859,6 @@ async function recursiveMetaEvolve(modelId: string, maxGenerations: number = 3):
 
   return evolved;
 }
-
-// ===========================================================================
-// Layer 18: Multi-Model Decomposition — route sub-questions to different models
-// ============================================================================
 
 const DECOMPOSITION_ROUTER_PROMPT = `You are a task decomposition and model routing expert. Given a problem and a list of available models, break the problem into sub-problems and assign each to the best-suited model.
 
@@ -3136,10 +2992,6 @@ ${subResults.map((r, i) => `Sub-problem ${i + 1} (${r.model}): ${r.answer.slice(
   };
 }
 
-// ===========================================================================
-// Layer 19: Per-Iteration Prompt Adaptation — evolve prompt mid-solve
-// ============================================================================
-
 const ITERATION_ADAPTATION_PROMPT = `You are a meta-reasoning expert. A solver has attempted a problem and failed. Analyze the failure pattern and suggest a PROMPT MODIFICATION (not a solution) that would help the solver on the next iteration.
 
 Current solver prompt (first 500 chars):
@@ -3230,10 +3082,6 @@ export function applyIterationAdaptation(prompt: string, adaptation: IterationAd
       return prompt;
   }
 }
-
-// ===========================================================================
-// Layer 20: ARC-AGI Benchmark Integration — validation against real benchmarks
-// ============================================================================
 
 export interface ArcChallenge {
   id: string;
@@ -3399,10 +3247,6 @@ async function runArcBenchmark(
   };
 }
 
-// ===========================================================================
-// Strategy templates — the base prompts the meta-system modifies
-// ============================================================================
-
 const CODE_REASONING_SOLVER = `You are a world-class expert in solving problems by writing executable JavaScript code. Your approach is methodical, creative, and highly effective. You produce elegant, efficient, and well-documented solutions.
 
 Your goal is to analyze a set of input-output examples and devise a JavaScript function that accurately transforms any input into its corresponding output. The key is to identify a *single, consistent transformation rule* that generalizes across *all* examples.
@@ -3559,10 +3403,6 @@ function generateExpertConfigs(taskConfig: TaskConfig, adaptations: StrategyAdap
   return experts;
 }
 
-// =============================================================================
-// Session management
-// =============================================================================
-
 const sessions = new Map<string, SessionState>();
 
 function createSession(id?: string): SessionState {
@@ -3593,10 +3433,6 @@ function getSession(sessionId?: string): SessionState {
   }
   return session;
 }
-
-// =============================================================================
-// Code sandbox — JS-exclusive via Node vm module
-// =============================================================================
 
 interface SandboxResult {
   ok: boolean;
@@ -3713,10 +3549,6 @@ if (typeof transform === 'function') {
   }
 }
 
-// =============================================================================
-// External verification command
-// =============================================================================
-
 async function runExternalVerify(
   code: string,
   input: unknown,
@@ -3782,10 +3614,6 @@ async function runExternalVerify(
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 }
-
-// =============================================================================
-// LLM caller — JS-exclusive via @mariozechner/pi-ai
-// =============================================================================
 
 interface LLMResponse {
   content: string;
@@ -3939,10 +3767,6 @@ async function callLLM(
   }
 }
 
-// =============================================================================
-// Code parsing
-// =============================================================================
-
 function parseCodeFromLLM(response: string): string | null {
   // Try javascript, js, typescript, ts code blocks
   const m = response.match(/```(?:javascript|js|typescript|ts)\s*(.*?)```/s);
@@ -3961,10 +3785,6 @@ function parseAnswerFromLLM(response: string): string {
 
   return response.trim();
 }
-
-// =============================================================================
-// Feedback building
-// =============================================================================
 
 function buildFeedbackBlock(
   solutions: Array<{ code: string; feedback: string; score: number }>,
@@ -3995,10 +3815,6 @@ ${s.score.toFixed(2)}
     )
     .join('\n\n');
 }
-
-// =============================================================================
-// Self-audit verification
-// =============================================================================
 
 interface AuditResult {
   verified: boolean;
@@ -4041,11 +3857,6 @@ ISSUES: [comma-separated list of problems found, or "none"]`;
 
   return { verified, confidence, issues };
 }
-
-// =============================================================================
-// Problem formatting — mirrors Poetiq's format_problem()
-// Converts raw grid data into <Diagram> text with optional per-iteration shuffle
-// =============================================================================
 
 /**
  * Format a problem from raw grid arrays into <Diagram> text.
@@ -4111,10 +3922,6 @@ ${gridToDiagram(testIn[c])}
 function gridToDiagram(grid: number[][]): string {
   return grid.map(row => row.join(' ')).join('\n');
 }
-
-// =============================================================================
-// Solve loop — the core iterative refinement engine
-// =============================================================================
 
 async function solveWithExpert(
   session: SessionState,
@@ -4584,10 +4391,6 @@ function buildDetailedFeedback(
   return parts.join('\n\n');
 }
 
-// =============================================================================
-// Grid utilities — mirrors Poetiq's numpy-based grid ops in pure JS
-// =============================================================================
-
 /** Ensure a value is a 2D array (expand 1D → 2D if needed) */
 function ensure2D(arr: unknown): number[][] | null {
   if (!Array.isArray(arr)) return null;
@@ -4624,10 +4427,6 @@ function arrayDiff(pred: number[][], truth: number[][]): string {
   }
   return lines.join('\n');
 }
-
-// =============================================================================
-// Voting
-// =============================================================================
 
 function rankByVoting(allResults: IterationResult[], config: ExpertConfig): IterationResult[] {
   const { useNewVoting, countFailedMatches, itersTiebreak, lowToHighIters } = config.voting;
@@ -4702,10 +4501,6 @@ function meanSoft(result: IterationResult): number {
   if (trs.length === 0) return 0;
   return trs.reduce((sum, r) => sum + r.softScore, 0) / trs.length;
 }
-
-// =============================================================================
-// Self-improvement
-// =============================================================================
 
 function learnFromProblem(session: SessionState): void {
   if (session.iterations.length === 0) return;
@@ -4823,10 +4618,6 @@ function learnFromProblem(session: SessionState): void {
   }
 }
 
-// =============================================================================
-// Action dispatch
-// =============================================================================
-
 async function dispatchAction(
   action: string,
   params: Record<string, unknown>,
@@ -4937,9 +4728,6 @@ async function dispatchAction(
 
       const solveStart = Date.now();
 
-      // =================================================================
-      // META-SYSTEM V3: 13 layers of proprietary parity
-      // =================================================================
       let metaFeatures: ProblemFeatures | null = null;
       let usedStrategyId: string | null = null;
       let usedCustomPrompts = false;
@@ -5042,9 +4830,6 @@ async function dispatchAction(
         }
       }
 
-      // =================================================================
-      // Expert config generation — with ensemble diversification (Layer 7)
-      // =================================================================
       let expertConfigs: ExpertConfig[];
 
       if (useMeta && metaFeatures && session.taskConfig.numExperts > 1 && usedHarnessSpecs.length > 0) {
@@ -5107,9 +4892,6 @@ async function dispatchAction(
         expertConfigs = generateExpertConfigs(session.taskConfig, session.strategyAdaptations);
       }
 
-      // =================================================================
-      // Layer 17: Meta-harness expert — assign a meta-harness to one expert
-      // =================================================================
       if (useMeta && metaFeatures && expertConfigs.length > 1) {
         const mhConfig = selectMetaHarnessExpertConfig(
           metaFeatures.category, expertConfigs[0], expertConfigs.length
@@ -5121,9 +4903,6 @@ async function dispatchAction(
         }
       }
 
-      // =================================================================
-      // Layer 18: Multi-model decomposition (when multiple models available)
-      // =================================================================
       let routedDecomposition: RoutedDecomposition | null = null;
       if (useMeta && session.taskConfig.models.length > 1 && (problem.length > 20 || trainInputs.length > 0)) {
         const routeProblem = problem || (trainInputs.length > 0
@@ -5139,9 +4918,6 @@ async function dispatchAction(
         }
       }
 
-      // =================================================================
-      // Layer 12: Progressive difficulty — order training examples
-      // =================================================================
       const orderedTrainInputs = [...trainInputs];
       const orderedTrainOutputs = [...trainOutputs];
       if (trainInputs.length > 2 && useMeta) {
@@ -5152,9 +4928,6 @@ async function dispatchAction(
         }
       }
 
-      // =================================================================
-      // SOLVE with budget bandit (Layer 4+9: early stopping + marginal ROI)
-      // =================================================================
       const allResults: IterationResult[] = [];
       const budget = { maxCost, maxTime, startTime: solveStart, costSoFar: session.totalCost };
 
@@ -6021,10 +5794,6 @@ async function dispatchAction(
       throw new Error(`Unknown action: ${action}`);
   }
 }
-
-// =============================================================================
-// HTTP Server
-// =============================================================================
 
 const PORT = Number(process.env.PI_REASON_HARNESS_PORT ?? 9880);
 const startedAt = Date.now();
