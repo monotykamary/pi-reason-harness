@@ -17,7 +17,7 @@
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn as spawnChild, type ChildProcess } from 'node:child_process';
-import type { ExtensionAPI, ExtensionContext } from '@mariozechner/pi-coding-agent';
+import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { createRuntimeStore } from './src/state/index.js';
 import { createWidgetUpdater, clearSessionUi } from './src/ui/index.js';
 import { installShellAlias, writeSessionId, getDirs } from './src/lifecycle/index.js';

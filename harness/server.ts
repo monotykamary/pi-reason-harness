@@ -13,7 +13,7 @@
  *   2. Experts: parallel solve loops with code sandbox + verification
  *   3. Voting: group-by-output ranking with diversity-first ordering
  *
- * JS-exclusive — LLM calls via @mariozechner/pi-ai, sandbox via Node vm module.
+ * JS-exclusive — LLM calls via @earendil-works/pi-ai, sandbox via Node vm module.
  * Zero Python dependency.
  *
  * Endpoints (bind 127.0.0.1:9880 by default; override with $PI_REASON_HARNESS_PORT):
@@ -40,7 +40,7 @@ import {
   type Context,
   type UserMessage,
   type SimpleStreamOptions,
-} from '@mariozechner/pi-ai';
+} from '@earendil-works/pi-ai';
 
 interface CustomProviderConfig {
   baseUrl: string;

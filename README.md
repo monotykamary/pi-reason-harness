@@ -4,7 +4,7 @@ Recursive self-improving reasoning harness — the proprietary layer rebuilt fro
 
 Builds task-specific reasoning strategies on top of any LLM by running iterative solve-verify-feedback loops with multi-expert ensembling, voting, and a **20-layer meta-system** that discovers, adapts, evolves, transfers, and validates strategies autonomously.
 
-**JS-exclusive** — LLM calls go through pi's native LLM infrastructure (`@mariozechner/pi-ai`). Code sandbox uses Node's `vm` module. Zero Python dependency.
+**JS-exclusive** — LLM calls go through pi's native LLM infrastructure (`@earendil-works/pi-ai`). Code sandbox uses Node's `vm` module. Zero Python dependency.
 
 ## How It Works
 
@@ -356,7 +356,7 @@ pi-reason-harness model-routes
 
 ## LLM Integration
 
-The harness uses `@mariozechner/pi-ai` for all LLM calls. Models are specified in `provider/model` format (e.g., `anthropic/claude-sonnet-4-5`, `openai/gpt-4o`). API keys are resolved from the same environment variables pi uses:
+The harness uses `@earendil-works/pi-ai` for all LLM calls. Models are specified in `provider/model` format (e.g., `anthropic/claude-sonnet-4-5`, `openai/gpt-4o`). API keys are resolved from the same environment variables pi uses:
 
 - `ANTHROPIC_API_KEY` — Anthropic models
 - `OPENAI_API_KEY` — OpenAI models
