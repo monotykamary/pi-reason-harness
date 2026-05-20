@@ -2,16 +2,28 @@
   "name": "pi-reason-harness",
   "version": "1.0.0",
   "description": "Recursive self-improving reasoning harness for pi — iterate, verify, improve. Builds task-specific reasoning strategies on top of any LLM.",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "bin": {
     "pi-reason-harness": "harness/cli.ts"
   },
-  "files": ["extensions", "harness", "skills", "README.md", "LICENSE"],
+  "files": [
+    "extensions",
+    "harness",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
   "license": "MIT",
   "type": "module",
   "pi": {
-    "extensions": ["./extensions"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "scripts": {
     "test": "vitest run",
@@ -19,16 +31,20 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
-    "typescript": "^6.0.2",
-    "vitest": "^4.1.2"
-  },
-  "dependencies": {
-    "@earendil-works/pi-ai": "*"
+    "@types/node": "25.9.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.7"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-ai": ">=0.74.0",
+    "@earendil-works/pi-coding-agent": ">=0.74.0",
+    "@earendil-works/pi-tui": ">=0.74.0",
+    "@sinclair/typebox": "0.34.49"
+  },
+  "overrides": {
+    "brace-expansion": "5.0.6",
+    "fast-xml-builder": "1.2.0",
+    "protobufjs": "8.4.0",
+    "ws": "8.20.1"
   }
 }
