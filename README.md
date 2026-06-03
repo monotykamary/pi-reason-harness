@@ -1,6 +1,17 @@
-# pi-reason-harness
+<div align="center">
 
-Recursive self-improving reasoning harness — the proprietary layer rebuilt from first principles.
+# 🤯 pi-reason-harness
+
+**Recursive self-improving reasoning harness for [pi](https://github.com/earendil-works/pi-coding-agent)**
+
+_20-layer meta-system that discovers, adapts, evolves, transfers, and validates strategies autonomously._
+
+[![pi extension](https://img.shields.io/badge/pi-extension-blueviolet)](https://github.com/earendil-works/pi-coding-agent)
+[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+
+</div>
+
+---
 
 Builds task-specific reasoning strategies on top of any LLM by running iterative solve-verify-feedback loops with multi-expert ensembling, voting, and a **20-layer meta-system** that discovers, adapts, evolves, transfers, and validates strategies autonomously.
 
