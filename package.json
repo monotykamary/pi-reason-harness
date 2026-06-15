@@ -1,7 +1,7 @@
 {
   "name": "pi-reason-harness",
-  "version": "1.0.0",
-  "description": "Recursive self-improving reasoning harness for pi — iterate, verify, improve. Builds task-specific reasoning strategies on top of any LLM.",
+  "version": "1.0.1",
+  "description": "Recursive self-improving reasoning harness for pi \u2014 iterate, verify, improve. Builds task-specific reasoning strategies on top of any LLM.",
   "keywords": [
     "pi-package"
   ],
@@ -33,12 +33,12 @@
   "devDependencies": {
     "@types/node": "25.9.1",
     "typescript": "6.0.3",
-    "vitest": "4.1.7"
+    "vitest": "4.1.7",
+    "@earendil-works/pi-tui": "0.79.4"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.74.0",
     "@earendil-works/pi-coding-agent": ">=0.74.0",
-    "@earendil-works/pi-tui": ">=0.74.0",
     "@sinclair/typebox": "0.34.49"
   },
   "overrides": {
