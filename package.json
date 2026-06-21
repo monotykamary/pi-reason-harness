@@ -1,7 +1,7 @@
 {
   "name": "pi-reason-harness",
   "version": "1.0.1",
-  "description": "Recursive self-improving reasoning harness for pi \u2014 iterate, verify, improve. Builds task-specific reasoning strategies on top of any LLM.",
+  "description": "Recursive self-improving reasoning harness for pi — iterate, verify, improve. Builds task-specific reasoning strategies on top of any LLM.",
   "keywords": [
     "pi-package"
   ],
@@ -46,5 +46,6 @@
     "fast-xml-builder": "1.2.0",
     "protobufjs": "8.4.0",
     "ws": "8.20.1"
-  }
+  },
+  "packageManager": "pnpm@11.6.0"
 }
