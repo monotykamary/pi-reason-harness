@@ -1,6 +1,6 @@
 {
   "name": "pi-reason-harness",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Recursive self-improving reasoning harness for pi — iterate, verify, improve. Builds task-specific reasoning strategies on top of any LLM.",
   "keywords": [
     "pi-package"
