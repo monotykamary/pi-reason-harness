@@ -36,10 +36,12 @@ import {
   getModel,
   getEnvApiKey,
   completeSimple,
-  type Model,
-  type Context,
-  type UserMessage,
-  type SimpleStreamOptions,
+} from '@earendil-works/pi-ai/compat';
+import type {
+  Model,
+  Context,
+  UserMessage,
+  SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
 
 interface CustomProviderConfig {
