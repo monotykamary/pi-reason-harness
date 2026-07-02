@@ -2,10 +2,9 @@
  * pi-reason-harness — Lifecycle helpers
  */
 
-import { homedir } from 'node:os';
 import * as fs from 'node:fs';
 import { join } from 'node:path';
-import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { getAgentDir, type ExtensionContext } from '@earendil-works/pi-coding-agent';
 
 export function getDirs() {
   const baseDir = join(process.cwd(), '.pi', 'reason-harness');
@@ -25,7 +24,7 @@ export function writeSessionId(ctx: ExtensionContext): void {
 
 export function installShellAlias(cliPath: string, projectRoot: string): void {
   try {
-    const agentBinDir = join(homedir(), '.pi', 'agent', 'bin');
+    const agentBinDir = join(getAgentDir(), 'bin');
     if (!fs.existsSync(agentBinDir)) {
       fs.mkdirSync(agentBinDir, { recursive: true });
     }
