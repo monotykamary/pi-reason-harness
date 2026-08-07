@@ -31,7 +31,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@earendil-works/pi-tui": "0.84.0",
+    "@earendil-works/pi-tui": "0.84.1",
     "@types/node": "25.9.1",
     "typescript": "6.0.3",
     "vitest": "4.1.7"
