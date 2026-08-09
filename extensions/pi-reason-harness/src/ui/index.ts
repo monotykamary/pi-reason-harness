@@ -22,7 +22,7 @@ export function createWidgetUpdater(
     extCtx.ui.setWidget('reason-harness', (_tui, theme) => {
       const parts = [
         theme.fg('accent', '🧠'),
-        theme.fg('text', ` ${runtime.sessionName}`),
+        theme.fg('muted', ` ${runtime.sessionName}`),
         theme.fg('dim', ` │ ${runtime.taskType}`),
         theme.fg('dim', ' │ '),
         theme.fg(
