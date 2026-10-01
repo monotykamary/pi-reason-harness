@@ -11,6 +11,11 @@ _20-layer meta-system that discovers, adapts, evolves, transfers, and validates 
 
 </div>
 
+## Pi 1.0 compatibility (1.0.17)
+
+Development SDKs are pinned to **1.0.0**; host-provided dependencies remain wildcard peers. Run `bun run test:pi` for offline real-host registrations, prompt/tool loadouts, nested calls, reload and shutdown. Set `PI1_HOST_PACKAGE` to an installed Pi package directory and `PI1_HOST_ENTRY=bundle` to check its bundled runtime.
+
+
 ---
 
 Builds task-specific reasoning strategies on top of any LLM by running iterative solve-verify-feedback loops with multi-expert ensembling, voting, and a **20-layer meta-system** that discovers, adapts, evolves, transfers, and validates strategies autonomously.
