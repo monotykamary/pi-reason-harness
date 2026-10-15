@@ -16,6 +16,10 @@
     "LICENSE"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/monotykamary/pi-reason-harness.git"
+  },
   "type": "module",
   "pi": {
     "extensions": [
